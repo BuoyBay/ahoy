@@ -1,0 +1,679 @@
+Import Common
+Import "Localization"
+
+Public Function DevConfig(filename As String) As JSONItem
+    Dim value As JSONItem = DevLoad(filename, True)
+    DevNeed(value.IsObject() And value.Value("schema").IsNumber() And DevNumber(value.Value("schema"), 0.0) = 1.0, "developer configuration requires schema: 1")
+    Return value
+End Function
+
+Public Function DevBad(status As String) As Boolean
+    Return DevHas(["failed", "error", "compile_error", "crash", "timeout", "protocol_error"], status)
+End Function
+
+Public Function DevCompiler(config As JSONItem) As String
+    Return DevEnvironment("BUOY", config.Value("compiler").AsString().Or("buoy"))
+End Function
+
+Public Function DevTestRecord(output As String) As JSONItem
+    Dim records As Array Of String = []
+    For Each line As String In DevLines(output)
+        If String.StartsWith(line, "BUOY_TESTKIT ", True) Then Array.Append(records, String.Substring(line, 13))
+    Next
+    DevNeed(Array.Count(records) = 1, "expected exactly one complete TestKit record")
+    Dim value As JSONItem = DevParse(records(0), True)
+    DevNeed(value.IsObject() And value.Value("schema").IsNumber() And DevNumber(value.Value("schema"), 0.0) = 1.0, "invalid TestKit schema")
+    DevNeed(value.Value("complete").AsBoolean().Or(False), "incomplete TestKit record")
+    DevNeed(DevString(value.Value("suite")) <> "", "TestKit suite name is required")
+    Dim cases As JSONItem = value.Value("cases")
+    DevNeed(cases.IsArray() And cases.Count() > 0, "empty TestKit record")
+    Dim names As Array Of String = []
+    For i As Integer = 0 To cases.Count() - 1
+        Dim entry As JSONItem = cases.ValueAt(i)
+        Dim name As String = DevString(entry.Value("name"))
+        DevNeed(name <> "" And Not DevHas(names, name), "invalid or duplicate TestKit case")
+        Array.Append(names, name)
+        DevNeed(DevHas(["passed", "failed", "error", "skipped"], DevString(entry.Value("status"))), "invalid TestKit outcome")
+        DevString(entry.Value("message"))
+        If entry.HasKey("duration") Then
+            Dim duration As Double = DevNumber(entry.Value("duration"), -1.0)
+            DevNeed(duration >= 0.0 And duration < Double.Infinity, "invalid TestKit case duration")
+        End If
+    Next
+    Return value
+End Function
+
+Private Function WithPhase(value As JSONItem, phaseName As String) As JSONItem
+    value.Value("phase") = phaseName
+    Return value
+End Function
+
+Private Function ArrayField(value As JSONItem, key As String) As JSONItem
+    If value.HasKey(key) Then Return value.Value(key)
+    Return JSONItem.NewArray()
+End Function
+
+Public Function DevRunSuite(root As String, config As JSONItem, suite As JSONItem, checkOnly As Boolean, targets As Array Of String, options As JSONItem) As JSONItem
+    If options = Nil Then options = JSONItem.NewObject()
+    Dim deadline As Double = DevNumber(options.Value("deadline"), 0.0)
+    Dim cancelFile As String = options.Value("cancel_file").AsString().Or("")
+    Dim selection As JSONItem = options.Value("selection")
+    Dim record As JSONItem = JSONItem.NewObject()
+    record.Value("name") = suite.Value("name")
+    record.Value("status") = "error"
+    Dim steps As JSONItem = JSONItem.NewArray()
+    record.Value("steps") = steps
+    record.Value("cases") = JSONItem.NewArray()
+    Dim work As String = ""
+    Try
+        Dim compiler As String = DevCompiler(config)
+        Dim timeout As Double = DevNumber(suite.Value("timeout"), DevNumber(config.Value("timeout"), 90.0))
+        Dim limit As Double = DevNumber(config.Value("log_limit"), 1048576.0)
+        DevNeed(limit >= 1.0 And limit <= 67108864.0 And Math.Floor(limit) = limit, "log_limit must be an integer in 1..67108864")
+        Dim logLimit As Integer = limit
+        Dim files As Array Of String = DevFiles(root, ArrayField(suite, "files"))
+        Dim packages As Array Of String = DevFiles(root, ArrayField(suite, "packages"))
+        Dim source As String = DevProjectPath(root, DevString(suite.Value("source")))
+        DevNeed(DevHas(files, source), "source must be in files")
+        Dim protocol As String = suite.Value("protocol").AsString().Or("exit")
+        DevNeed(DevHas(["exit", "testkit"], protocol), "unknown test protocol: " + protocol)
+        Dim arguments As Array Of String = DevStrings(ArrayField(suite, "args"))
+        work = DevTemp("buoy-test-")
+        For Each filename As String In files
+            Dim relative As String = String.Substring(filename, String.Len(root) + 1)
+            Dim firstPart As String = String.Split(relative, "/")(0)
+            DevNeed(firstPart <> "packages" And firstPart <> ".buoy", "stage packages with the packages field")
+            Dim destination As New FileSystemItem(Path.Join(work, relative))
+            DevMkdir(destination.ParentPath())
+            Dim original As New FileSystemItem(filename)
+            DevNeed(original.CopyTo(destination), "cannot stage input: " + relative)
+        Next
+        DevMkdir(Path.Join(work, "packages"))
+        For Each filename As String In packages
+            Dim archive As New FileSystemItem(filename)
+            Dim destination As New FileSystemItem(Path.Join(work, "packages/" + archive.Name()))
+            DevNeed(Not destination.Exists(), "duplicate staged package: " + archive.Name())
+            DevNeed(archive.CopyTo(destination), "cannot stage package: " + filename)
+        Next
+        Dim staged As String = Path.Join(work, String.Substring(source, String.Len(root) + 1))
+        Dim checks As Array Of String = targets
+        If Array.Count(checks) = 0 Then checks = [""]
+        For Each target As String In checks
+            Dim argv As Array Of String = Array.AsResizable([compiler, staged, "--check", "--diagnostic-format", "json"])
+            If target <> "" Then
+                Array.Append(argv, "--target")
+                Array.Append(argv, target)
+            End If
+            Dim outcome As JSONItem = WithPhase(DevExecute(argv, work, timeout, logLimit, Nil, deadline, cancelFile), "check")
+            If target = "" Then
+                outcome.Value("target") = JSONItem.Null()
+            Else
+                outcome.Value("target") = target
+            End If
+            steps.Add(outcome)
+            If outcome.Value("cancelled").AsBoolean().Or(False) Then
+                record.Value("cancelled") = True
+                record.Value("message") = "cancelled"
+                Return record
+            End If
+            If outcome.Value("timeout").AsBoolean().Or(False) Then
+                record.Value("status") = "timeout"
+                Return record
+            End If
+            Dim diagnostic As JSONItem
+            Try
+                diagnostic = DevDiagnostics(outcome)
+            Catch e As Exception
+                record.Value("status") = "protocol_error"
+                record.Value("message") = e.Message
+                Return record
+            End Try
+            outcome.Value("diagnostics") = diagnostic
+            If DevNumber(outcome.Value("returncode"), 1.0) <> 0.0 Or diagnostic.Value("errors").Count() > 0 Then
+                record.Value("status") = "compile_error"
+                Return record
+            End If
+        Next
+        If checkOnly Then
+            record.Value("status") = "checked"
+            Return record
+        End If
+        Dim executable As String = Path.Join(work, "test")
+        #If TargetWindows Then
+            executable += ".exe"
+        #End If
+        Dim built As JSONItem = WithPhase(DevExecute(DevCompilerBuild(compiler, staged, executable), work, timeout, logLimit, Nil, deadline, cancelFile), "build")
+        steps.Add(built)
+        If built.Value("cancelled").AsBoolean().Or(False) Then
+            record.Value("cancelled") = True
+            record.Value("message") = "cancelled"
+            Return record
+        End If
+        If built.Value("timeout").AsBoolean().Or(False) Then
+            record.Value("status") = "timeout"
+            Return record
+        End If
+        If DevNumber(built.Value("returncode"), 1.0) <> 0.0 Then
+            record.Value("status") = "compile_error"
+            Return record
+        End If
+        DevDeployCompilerRuntime(compiler, work)
+        Dim argv As Array Of String = Array.AsResizable([executable])
+        For Each argument As String In arguments
+            Array.Append(argv, argument)
+        Next
+        Dim environment As New Map Of String, String()
+        environment.Set("TMPDIR", work)
+        environment.Set("TMP", work)
+        environment.Set("TEMP", work)
+        environment.Set("BUOY_TESTKIT_SELECTION", "")
+        If Not selection.IsNull() Then
+            Dim selectionPath As String = Path.Join(work, ".buoy-test-selection.json")
+            DevWrite(selectionPath, Json.Stringify(selection))
+            environment.Set("BUOY_TESTKIT_SELECTION", selectionPath)
+        End If
+        Dim ran As JSONItem = WithPhase(DevExecute(argv, work, timeout, logLimit, environment, deadline, cancelFile), "run")
+        steps.Add(ran)
+        record.Value("duration") = ran.Value("seconds")
+        Dim exitStatus As Double = DevNumber(ran.Value("returncode"), 1.0)
+        If ran.Value("cancelled").AsBoolean().Or(False) Then
+            record.Value("cancelled") = True
+            record.Value("message") = "cancelled"
+            Return record
+        End If
+        If ran.Value("timeout").AsBoolean().Or(False) Then
+            record.Value("status") = "timeout"
+        ElseIf exitStatus < 0.0 Or exitStatus >= 3221225472.0 Then
+            record.Value("status") = "crash"
+        ElseIf protocol = "exit" Then
+            record.Value("status") = "passed"
+            If exitStatus <> 0.0 Then record.Value("status") = "failed"
+        Else
+            Try
+                DevNeed(Not ran.Value("stdout_truncated").AsBoolean().Or(ran.Value("truncated").AsBoolean().Or(False)), "truncated TestKit output cannot establish a unique complete result")
+                Dim value As JSONItem = DevTestRecord(DevString(ran.Value("stdout")))
+                Dim cases As JSONItem = value.Value("cases")
+                record.Value("cases") = cases
+                If Not selection.IsNull() Then
+                    ValidateSelection(value, selection)
+                    record.Value("selection") = value.Value("selection")
+                End If
+                Dim failed As Boolean = False
+                For i As Integer = 0 To cases.Count() - 1
+                    If DevBad(DevString(cases.ValueAt(i).Value("status"))) Then failed = True
+                Next
+                DevNeed(failed = (exitStatus <> 0.0), "TestKit results and exit status disagree")
+                record.Value("status") = "passed"
+                If failed Then record.Value("status") = "failed"
+            Catch e As Exception
+                record.Value("status") = "protocol_error"
+                record.Value("message") = e.Message
+            End Try
+        End If
+    Catch e As Exception
+        record.Value("status") = "error"
+        record.Value("message") = e.Message
+    Finally
+        If work <> "" Then DevRemoveTree(work)
+    End Try
+    Return record
+End Function
+
+Private Class ReportInterrupted Inherits Exception
+    Public Property Cancelled As Boolean
+    Public Sub Constructor(cancelled As Boolean)
+        Super.Constructor("report export interrupted")
+        Me.Cancelled = cancelled
+    End Sub
+End Class
+
+Private Sub CheckReportBudget(deadline As Double, cancelFile As String)
+    If DevCancelled(cancelFile) Then Throw New ReportInterrupted(True)
+    If deadline > 0.0 And System.Microseconds() / 1000000.0 >= deadline Then Throw New ReportInterrupted(False)
+End Sub
+
+Private Function XmlText(value As String, deadline As Double = 0.0, cancelFile As String = "") As String
+    Dim characters As Array Of String = String.Chars(value)
+    For index As Integer = 0 To Array.Count(characters) - 1
+        If index Mod 4096 = 0 Then CheckReportBudget(deadline, cancelFile)
+        Dim ch As String = characters(index)
+        Dim code As Integer = String.Asc(ch)
+        Select Case code
+        Case 9
+            characters(index) = "&#9;"
+        Case 10
+            characters(index) = "&#10;"
+        Case 13
+            characters(index) = "&#13;"
+        Case 34
+            characters(index) = "&quot;"
+        Case 38
+            characters(index) = "&amp;"
+        Case 60
+            characters(index) = "&lt;"
+        Case 62
+            characters(index) = "&gt;"
+        Case Else
+            If Not ((code >= 32 And code <= 55295) Or (code >= 57344 And code <= 65533) Or (code >= 65536 And code <= 1114111)) Then characters(index) = ""
+        End Select
+    Next
+    Return String.Join(characters, "")
+End Function
+
+Private Function FallbackCase(suite As JSONItem, caseName As String) As JSONItem
+    Dim entry As JSONItem = JSONItem.NewObject()
+    entry.Value("name") = caseName
+    entry.Value("status") = suite.Value("status")
+    entry.Value("message") = suite.Value("message").AsString().Or("")
+    Return entry
+End Function
+
+Public Function DevJUnit(report As JSONItem, deadline As Double = 0.0, cancelFile As String = "") As String
+    CheckReportBudget(deadline, cancelFile)
+    Dim content As Array Of String = []
+    Array.Append(content, "<?xml version='1.0' encoding='utf-8'?>\n<testsuites>")
+    Dim suites As JSONItem = report.Value("suites")
+    For index As Integer = 0 To suites.Count() - 1
+        Dim suite As JSONItem = suites.ValueAt(index)
+        Dim cases As JSONItem = DevParse(Json.Stringify(suite.Value("cases")))
+        If cases.Count() = 0 Then
+            cases.Add(FallbackCase(suite, DevString(suite.Value("name"))))
+        ElseIf DevBad(DevString(suite.Value("status"))) And DevString(suite.Value("status")) <> "failed" Then
+            cases.Add(FallbackCase(suite, "runner"))
+        End If
+        Dim failures As Integer = 0
+        Dim errors As Integer = 0
+        Dim skipped As Integer = 0
+        For i As Integer = 0 To cases.Count() - 1
+            Dim status As String = DevString(cases.ValueAt(i).Value("status"))
+            If status = "failed" Then failures += 1
+            If DevBad(status) And status <> "failed" Then errors += 1
+            If status = "skipped" Or status = "checked" Then skipped += 1
+        Next
+        CheckReportBudget(deadline, cancelFile)
+        Dim suiteName As String = XmlText(DevString(suite.Value("name")), deadline, cancelFile)
+        Array.Append(content, "<testsuite name=\"" + suiteName + "\" tests=\"" + Str(cases.Count()) + "\" failures=\"" + Str(failures) + "\" errors=\"" + Str(errors) + "\" skipped=\"" + Str(skipped) + "\"")
+        If suite.HasKey("duration") Then Array.Append(content, " time=\"" + FixedTime(DevNumber(suite.Value("duration"), 0.0)) + "\"")
+        Array.Append(content, ">")
+        For i As Integer = 0 To cases.Count() - 1
+            Dim entry As JSONItem = cases.ValueAt(i)
+            Dim status As String = DevString(entry.Value("status"))
+            Dim message As String = XmlText(entry.Value("message").AsString().Or(""), deadline, cancelFile)
+            Array.Append(content, "<testcase name=\"" + XmlText(DevString(entry.Value("name")), deadline, cancelFile) + "\" classname=\"" + suiteName + "\"")
+            If entry.HasKey("duration") Then Array.Append(content, " time=\"" + FixedTime(DevNumber(entry.Value("duration"), 0.0)) + "\"")
+            Array.Append(content, ">")
+            If DevBad(status) Then
+                Dim kind As String = "error"
+                If status = "failed" Then kind = "failure"
+                Array.Append(content, "<" + kind + " type=\"" + status + "\" message=\"" + message + "\">" + message + "</" + kind + ">")
+            ElseIf status = "skipped" Or status = "checked" Then
+                If status = "checked" Then message = "compile check only"
+                Array.Append(content, "<skipped message=\"" + message + "\"/>")
+            End If
+            Array.Append(content, "</testcase>")
+        Next
+        For Each stream As String In ["stdout", "stderr"]
+            Dim kind As String = "system-out"
+            If stream = "stderr" Then kind = "system-err"
+            Dim logs As Array Of String = []
+            Dim steps As JSONItem = suite.Value("steps")
+            For i As Integer = 0 To steps.Count() - 1
+                Array.Append(logs, steps.ValueAt(i).Value(stream).AsString().Or(""))
+            Next
+            Array.Append(content, "<" + kind + ">" + XmlText(String.Join(logs, "\n"), deadline, cancelFile) + "</" + kind + ">")
+        Next
+        Array.Append(content, "</testsuite>")
+    Next
+    Return String.Join(content, "") + "</testsuites>\n"
+End Function
+
+Private Function FixedTime(seconds As Double) As String
+    Return String.Format(seconds, "0.000000")
+End Function
+
+Private Function MatchesAny(name As String, patterns As JSONItem, emptyValue As Boolean) As Boolean
+    If patterns.Count() = 0 Then Return emptyValue
+    For Each pattern As String In DevStrings(patterns)
+        If DevPattern(name, pattern) Then Return True
+    Next
+    Return False
+End Function
+
+Private Sub ValidateSelection(value As JSONItem, selection As JSONItem)
+    DevNeed(DevExact(DevString(value.Value("suite")), DevString(selection.Value("suite"))), "TestKit runtime suite mismatch")
+    Dim ack As JSONItem = value.Value("selection")
+    DevNeed(ack.IsObject() And DevNumber(ack.Value("version"), 0.0) = 1.0 And ack.Value("applied").AsBoolean().Or(False), "missing or invalid TestKit selection acknowledgement")
+    Dim cases As JSONItem = value.Value("cases")
+    Dim names As Array Of String = []
+    Dim selected As Integer = 0
+    For i As Integer = 0 To cases.Count() - 1
+        Dim entry As JSONItem = cases.ValueAt(i)
+        Dim name As String = DevString(entry.Value("name"))
+        Array.Append(names, name)
+        DevNeed(entry.Value("selected").IsBoolean(), "missing case selected flag")
+        Dim allowed As Boolean = MatchesAny(name, selection.Value("include"), True) And Not MatchesAny(name, selection.Value("exclude"), False)
+        If Not selection.Value("exact").IsNull() Then allowed = allowed And DevHas(DevStrings(selection.Value("exact")), name)
+        If entry.Value("selected").AsBoolean().Or(False) Then
+            DevNeed(allowed, "producer executed an excluded case")
+            selected += 1
+        Else
+            DevNeed(DevString(entry.Value("status")) = "skipped" And DevExact(entry.Value("message").AsString().Or(""), "not selected") And DevNumber(entry.Value("duration"), -1.0) = 0.0, "invalid excluded case")
+        End If
+    Next
+    DevNeed(DevNumber(ack.Value("selected"), -1.0) = selected And DevNumber(ack.Value("discovered"), -1.0) = cases.Count(), "invalid selection counts")
+    Dim missing As Array Of String = []
+    If Not selection.Value("exact").IsNull() Then
+        For Each name As String In DevStrings(selection.Value("exact"))
+            If Not DevHas(names, name) Then Array.Append(missing, name)
+        Next
+    End If
+    Dim unmatched As Array Of String = DevStrings(ack.Value("unmatched"))
+    DevNeed(Array.Count(unmatched) = Array.Count(missing), "invalid unmatched acknowledgement")
+    For Each name As String In missing
+        DevNeed(DevHas(unmatched, name), "invalid unmatched acknowledgement")
+    Next
+End Sub
+
+Private Sub MergeSelection(mapping As JSONItem, name As String, cases As JSONItem)
+    DevNeed(name <> "", "selection suite name is empty")
+    If Not cases.IsNull() Then
+        DevNeed(cases.IsArray() And cases.Count() > 0, "selection cases must be null or a nonempty array")
+        Dim unique As JSONItem = JSONItem.NewArray()
+        For Each item As String In DevStrings(cases)
+            DevNeed(item <> "", "selection case name is empty")
+            If Not DevHas(DevStrings(unique), item) Then unique.Add(item)
+        Next
+        cases = unique
+    End If
+    If mapping.HasKey(name) Then
+        If mapping.Value(name).IsNull() Then Exit Sub
+        If Not cases.IsNull() Then
+            For Each item As String In DevStrings(cases)
+                If Not DevHas(DevStrings(mapping.Value(name)), item) Then mapping.Value(name).Add(item)
+            Next
+            Exit Sub
+        End If
+    End If
+    mapping.Value(name) = cases
+End Sub
+
+Private Sub ValidatePriorSuite(entry As JSONItem)
+    Dim status As String = DevString(entry.Value("status"))
+    DevNeed(DevBad(status) Or DevHas(["passed", "checked"], status), "invalid report suite status")
+    Dim cases As JSONItem = entry.Value("cases")
+    DevNeed(cases.IsArray(), "report cases must be an array")
+    Dim names As Array Of String = []
+    Dim failed As Boolean = False
+    For index As Integer = 0 To cases.Count() - 1
+        Dim item As JSONItem = cases.ValueAt(index)
+        Dim name As String = DevString(item.Value("name"))
+        DevNeed(name <> "" And Not DevHas(names, name), "invalid or duplicate rerun case")
+        Array.Append(names, name)
+        Dim outcome As String = DevString(item.Value("status"))
+        DevNeed(DevHas(["passed", "failed", "error", "skipped"], outcome), "invalid rerun case outcome")
+        DevString(item.Value("message"))
+        If DevHas(["failed", "error"], outcome) Then failed = True
+    Next
+    DevNeed(DevBad(status) Or Not failed, "rerun suite status disagrees with its cases")
+End Sub
+
+Public Function DevRunTests(configPath As String, filter As String, listOnly As Boolean, checkOnly As Boolean, targets As Array Of String, jsonPath As String, junitPath As String, options As JSONItem) As Integer
+    Dim started As Double = System.Microseconds() / 1000000.0
+    If options = Nil Then options = JSONItem.NewObject()
+    DevNeed(jsonPath = "" Or junitPath = "" Or Not DevPathsEqual(jsonPath, junitPath), "JSON and JUnit outputs must use different paths")
+    DevNeed(Array.Count(targets) = 0 Or checkOnly, "--target requires --check-only")
+    DevNeed(Not (options.HasKey("--selection") And options.HasKey("--rerun-failed")), "--selection and --rerun-failed are mutually exclusive")
+    Dim repeatValue As Double = 1.0
+    If options.HasKey("--repeat") Then repeatValue = Integer.Parse(DevString(options.Value("--repeat"))).Or(0)
+    DevNeed(repeatValue >= 1.0 And repeatValue <= 1000.0 And Math.Floor(repeatValue) = repeatValue, "--repeat must be an integer in 1..1000")
+    Dim repetitions As Integer = repeatValue
+    DevNeed(Not checkOnly Or (repetitions = 1 And Not options.HasKey("--case") And Not options.HasKey("--exclude-case") And Not options.HasKey("--selection") And Not options.HasKey("--rerun-failed")), "case selection, reruns and repetition require runtime tests")
+    Dim untilFailure As Boolean = options.Value("--until-failure").AsBoolean().Or(False)
+    DevNeed(Not untilFailure Or repetitions > 1, "--until-failure requires --repeat > 1")
+    Dim budget As Double = 0.0
+    If repetitions > 1 Then budget = 300.0
+    If options.HasKey("--deadline") Then
+        budget = Double.Parse(DevString(options.Value("--deadline"))).Or(0.0)
+        DevNeed(budget > 0.0 And budget < Double.Infinity, "--deadline must be positive and finite")
+    End If
+    Dim deadline As Double = 0.0
+    If budget > 0.0 Then deadline = started + budget
+    Dim cancelFile As String = options.Value("--cancel-file").AsString().Or("")
+    If cancelFile <> "" Then cancelFile = DevAbsolute(cancelFile)
+    Dim mapping As JSONItem = JSONItem.NewObject()
+    Dim exactSelection As Boolean = options.HasKey("--selection") Or options.HasKey("--rerun-failed")
+    If exactSelection Then
+        Dim filename As String = options.Value("--selection").AsString().Or(options.Value("--rerun-failed").AsString().Or(""))
+        Dim input As JSONItem = DevLoad(filename, True)
+        DevNeed(input.IsObject(), "selection/report must be an object")
+        Dim entries As JSONItem = input.Value("suites")
+        DevNeed(entries.IsArray(), "selection requires suites")
+        If options.HasKey("--selection") Then
+            DevNeed(DevNumber(input.Value("version"), 0.0) = 1.0, "invalid selection version")
+        Else
+            DevNeed(DevNumber(input.Value("schema"), 0.0) = 1.0 And input.Value("complete").AsBoolean().Or(False), "rerun requires complete schema-1 report")
+        End If
+        For i As Integer = 0 To entries.Count() - 1
+            Dim entry As JSONItem = entries.ValueAt(i)
+            Dim name As String = DevString(entry.Value("name"))
+            Dim cases As JSONItem = entry.Value("cases")
+            If options.HasKey("--rerun-failed") Then
+                ValidatePriorSuite(entry)
+                Dim status As String = DevString(entry.Value("status"))
+                DevNeed(DevBad(status) Or DevHas(["passed", "checked"], status), "invalid report suite status")
+                If Not DevBad(status) Then Continue For
+                Dim failedCases As JSONItem = JSONItem.NewArray()
+                If cases.IsNull() Then cases = JSONItem.NewArray()
+                DevNeed(cases.IsArray(), "report cases must be an array")
+                For j As Integer = 0 To cases.Count() - 1
+                    Dim item As JSONItem = cases.ValueAt(j)
+                    If DevHas(["failed", "error"], DevString(item.Value("status"))) Then failedCases.Add(DevString(item.Value("name")))
+                Next
+                cases = failedCases
+                If status <> "failed" Or cases.Count() = 0 Then cases = JSONItem.Null()
+            Else
+                DevNeed(entry.HasKey("cases"), "selection cases is required")
+            End If
+            MergeSelection(mapping, name, cases)
+        Next
+        If options.HasKey("--rerun-failed") And input.HasKey("not_run") Then
+            For Each name As String In DevStrings(input.Value("not_run"))
+                MergeSelection(mapping, name, JSONItem.Null())
+            Next
+        End If
+    End If
+    Dim file As New FileSystemItem(DevAbsolute(configPath))
+    Dim root As String = file.ParentPath()
+    Dim config As JSONItem = DevConfig(file.FullPath())
+    Dim suites As JSONItem = config.Value("tests")
+    DevNeed(suites.IsArray() And suites.Count() > 0, "configuration has no tests")
+    Dim names As Array Of String = []
+    Dim selected As JSONItem = JSONItem.NewArray()
+    For i As Integer = 0 To suites.Count() - 1
+        Dim suite As JSONItem = suites.ValueAt(i)
+        Dim name As String = DevString(suite.Value("name"))
+        DevNeed(name <> "" And Not DevHas(names, name), "suite names must be nonempty and unique")
+        Array.Append(names, name)
+        If Not DevGlob(name, filter) Or Not MatchesAny(name, ArrayField(options, "--suite"), True) Or MatchesAny(name, ArrayField(options, "--exclude-suite"), False) Then Continue For
+        If exactSelection And Not mapping.HasKey(name) Then Continue For
+        If suite.HasKey("testkit_suite") Then DevNeed(DevString(suite.Value("testkit_suite")) <> "", "testkit_suite must be nonempty")
+        Dim caseSelection As Boolean = options.HasKey("--case") Or options.HasKey("--exclude-case") Or (mapping.HasKey(name) And Not mapping.Value(name).IsNull())
+        DevNeed(Not caseSelection Or suite.Value("protocol").AsString().Or("exit") = "testkit", "case selection requires testkit protocol: " + name)
+        selected.Add(suite)
+    Next
+    Dim report As JSONItem = JSONItem.NewObject()
+    report.Value("schema") = 1
+    report.Value("complete") = True
+    Dim unmatched As JSONItem = JSONItem.NewArray()
+    For Each key As String In mapping.Keys()
+        If Not DevHas(names, key) Then
+            Dim missing As JSONItem = JSONItem.NewObject()
+            missing.Value("suite") = key
+            missing.Value("cases") = mapping.Value(key)
+            unmatched.Add(missing)
+        End If
+    Next
+    Dim summary As JSONItem = JSONItem.NewObject()
+    summary.Value("unmatched") = unmatched
+    report.Value("selection") = summary
+    Dim outcomes As JSONItem = JSONItem.NewArray()
+    report.Value("suites") = outcomes
+    Dim representatives As JSONItem = JSONItem.NewObject()
+    Dim iterations As JSONItem = JSONItem.NewArray()
+    report.Value("iterations") = iterations
+    Dim notRun As JSONItem = JSONItem.NewArray()
+    report.Value("not_run") = notRun
+    Dim failed As Boolean = False
+    Dim cancelled As Boolean = False
+    Dim usageError As Boolean = unmatched.Count() > 0 Or selected.Count() = 0
+    If listOnly Then
+        For index As Integer = 0 To selected.Count() - 1
+            Print DevString(selected.ValueAt(index).Value("name"))
+        Next
+        If usageError Then Return 2
+        Return 0
+    End If
+    Dim stopReason As String = "count"
+    Dim completed As Integer = 0
+    Dim selectedCases As Integer = 0
+    For iteration As Integer = 1 To repetitions
+        If usageError Then Exit For
+        Dim iterationStart As Double = System.Microseconds() / 1000000.0
+        Dim evidence As JSONItem = JSONItem.NewObject()
+        evidence.Value("index") = iteration
+        Dim records As JSONItem = JSONItem.NewArray()
+        evidence.Value("suites") = records
+        Dim finishedIteration As Boolean = True
+        For index As Integer = 0 To selected.Count() - 1
+            Dim suite As JSONItem = selected.ValueAt(index)
+            Dim name As String = DevString(suite.Value("name"))
+            If DevCancelled(cancelFile) Then
+                cancelled = True
+                finishedIteration = False
+                For pending As Integer = index To selected.Count() - 1
+                    notRun.Add(selected.ValueAt(pending).Value("name"))
+                Next
+                Exit For
+            End If
+            Dim runOptions As JSONItem = JSONItem.NewObject()
+            runOptions.Value("deadline") = deadline
+            runOptions.Value("cancel_file") = cancelFile
+            If options.HasKey("--case") Or options.HasKey("--exclude-case") Or (mapping.HasKey(name) And Not mapping.Value(name).IsNull()) Then
+                Dim selection As JSONItem = JSONItem.NewObject()
+                selection.Value("version") = 1
+                Dim runtimeName As String = name
+                If suite.HasKey("testkit_suite") Then runtimeName = DevString(suite.Value("testkit_suite"))
+                DevNeed(runtimeName <> "", "testkit_suite must be nonempty")
+                selection.Value("suite") = runtimeName
+                selection.Value("include") = ArrayField(options, "--case")
+                selection.Value("exclude") = ArrayField(options, "--exclude-case")
+                selection.Value("exact") = mapping.Value(name)
+                runOptions.Value("selection") = selection
+            End If
+            Dim record As JSONItem = DevRunSuite(root, config, suite, checkOnly, targets, runOptions)
+            If deadline > 0.0 And System.Microseconds() / 1000000.0 >= deadline And Not DevBad(DevString(record.Value("status"))) Then
+                record.Value("status") = "timeout"
+                record.Value("message") = "overall deadline exhausted"
+            End If
+            cancelled = record.Value("cancelled").AsBoolean().Or(False)
+            Dim expired As Boolean = deadline > 0.0 And System.Microseconds() / 1000000.0 >= deadline
+            If expired And Not cancelled And Not DevBad(DevString(record.Value("status"))) Then record.Value("status") = "timeout"
+            records.Add(record)
+            If Not representatives.HasKey(name) Then
+                representatives.Value(name) = record
+            ElseIf Not DevBad(DevString(representatives.Value(name).Value("status"))) Then
+                representatives.Value(name) = record
+            End If
+            Print name + ": " + DevString(record.Value("status"))
+            StdOut.Flush()
+            If record.HasKey("selection") Then
+                selectedCases += DevNumber(record.Value("selection").Value("selected"), 0.0)
+                Dim missingCases As JSONItem = record.Value("selection").Value("unmatched")
+                If missingCases.Count() > 0 Then
+                    Dim missing As JSONItem = JSONItem.NewObject()
+                    missing.Value("suite") = name
+                    missing.Value("cases") = missingCases
+                    unmatched.Add(missing)
+                End If
+            ElseIf Not runOptions.HasKey("selection") Or checkOnly Then
+                selectedCases += 1
+            End If
+            If DevBad(DevString(record.Value("status"))) Then failed = True
+            If cancelled Or expired Or (untilFailure And DevBad(DevString(record.Value("status")))) Then
+                If cancelled Or index < selected.Count() - 1 Then finishedIteration = False
+                For pending As Integer = index + 1 To selected.Count() - 1
+                    notRun.Add(selected.ValueAt(pending).Value("name"))
+                Next
+                If expired Then
+                    stopReason = "deadline"
+                    failed = True
+                ElseIf Not cancelled Then
+                    stopReason = "failure"
+                End If
+                Exit For
+            End If
+        Next
+        evidence.Value("duration") = System.Microseconds() / 1000000.0 - iterationStart
+        If records.Count() > 0 Then iterations.Add(evidence)
+        If finishedIteration Then completed += 1
+        If cancelled Or stopReason <> "count" Then Exit For
+        If unmatched.Count() > 0 Then Exit For
+        If selectedCases = 0 And Not failed Then
+            usageError = True
+            Exit For
+        End If
+    Next
+    For i As Integer = 0 To selected.Count() - 1
+        Dim name As String = DevString(selected.ValueAt(i).Value("name"))
+        If representatives.HasKey(name) Then outcomes.Add(representatives.Value(name))
+    Next
+    If cancelled Then stopReason = "cancelled"
+    If Not cancelled And (usageError Or unmatched.Count() > 0 Or (selectedCases = 0 And Not failed)) Then stopReason = "selection"
+    If selectedCases = 0 And Not cancelled And Not failed Then summary.Value("empty") = True
+    report.Value("cancelled") = cancelled
+    Dim repeat As JSONItem = JSONItem.NewObject()
+    repeat.Value("requested") = repetitions
+    repeat.Value("completed") = completed
+    repeat.Value("until_failure") = untilFailure
+    repeat.Value("stop_reason") = stopReason
+    report.Value("repeat") = repeat
+    Dim xml As String = ""
+    Try
+        If Not cancelled And stopReason <> "deadline" Then
+            CheckReportBudget(deadline, cancelFile)
+            If junitPath <> "" Then xml = DevJUnit(report, deadline, cancelFile)
+            CheckReportBudget(deadline, cancelFile)
+        End If
+    Catch e As ReportInterrupted
+        cancelled = e.Cancelled
+        failed = True
+        xml = ""
+        report.Value("cancelled") = cancelled
+        report.Value("export_interrupted") = True
+        repeat.Value("stop_reason") = "deadline"
+        If cancelled Then repeat.Value("stop_reason") = "cancelled"
+        If outcomes.Count() > 0 Then
+            Dim interrupted As JSONItem = outcomes.ValueAt(outcomes.Count() - 1)
+            If Not DevBad(DevString(interrupted.Value("status"))) Then
+                interrupted.Value("status") = "timeout"
+                If cancelled Then interrupted.Value("status") = "error"
+                interrupted.Value("message") = e.Message
+                interrupted.Value("cancelled") = cancelled
+            End If
+        End If
+    End Try
+    If jsonPath <> "" Then DevWrite(jsonPath, Json.Stringify(report) + "\n")
+    If junitPath <> "" And xml <> "" Then DevWrite(junitPath, xml)
+    If cancelled Then Return 3
+    If usageError Or unmatched.Count() > 0 Or (selectedCases = 0 And Not failed) Then Return 2
+    If failed Then Return 1
+    Return 0
+End Function
+
+Public Function DevRunSuite(root As String, config As JSONItem, suite As JSONItem, checkOnly As Boolean, targets As Array Of String) As JSONItem
+    Return DevRunSuite(root, config, suite, checkOnly, targets, JSONItem.NewObject())
+End Function
+
+Public Function DevRunTests(configPath As String, filter As String, listOnly As Boolean, checkOnly As Boolean, targets As Array Of String, jsonPath As String, junitPath As String) As Integer
+    Return DevRunTests(configPath, filter, listOnly, checkOnly, targets, jsonPath, junitPath, JSONItem.NewObject())
+End Function

@@ -1,0 +1,208 @@
+Import Common
+Import processkit
+
+#If TargetWindows Then
+Private Declare Function B_ProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As UInt32
+#Else
+Private Declare Function B_ProcessId Lib "c" Alias "getpid" () As Int32
+#End If
+
+Private Class BuildLock
+    Public Property Child As PipeProcess
+
+    Public Function Acquire(python As String, helper As String, root As String, deadline As Double, cancelFile As String) As Integer
+        Dim started As Integer = System.Microseconds()
+        Dim environment As New Map Of String, String()
+        Me.Child = New PipeProcess(python, ["-B", helper, "lock", "--root", root, "--pid", Str(B_ProcessId())], root, environment, True)
+        Dim output As String = ""
+        Dim errors As String = ""
+        Do
+            output += Me.Child.ReadOutput().ToString(Text.Encodings.UTF8)
+            errors += Me.Child.ReadError().ToString(Text.Encodings.UTF8)
+            If String.Contains(String.Replace(output, "\r\n", "\n"), "BUOY_BUILD_LOCKED\n", True) Then Return 0
+            If DevCancelled(cancelFile) Then Return 3
+            If System.Microseconds() / 1000000.0 >= deadline Then Return 1
+            Dim running As Boolean = Me.Child.Poll()
+            If Not running And Me.Child.OutputClosed And Me.Child.ErrorClosed Then
+                StdErr.Write(errors)
+                Return 2
+            End If
+            DevNeed(String.Len(output) + String.Len(errors) < 65536, "invalid lock helper output")
+            Sleep(1)
+        Loop
+    End Function
+
+    Public Sub Close()
+        If Me.Child = Nil Then Exit Sub
+        Me.Child.CloseInput()
+        Dim started As Integer = System.Microseconds()
+        While Me.Child.Poll() And System.Microseconds() - started < 2000000
+            Sleep(1)
+        End While
+        Me.Child.Close()
+        Me.Child = Nil
+    End Sub
+End Class
+
+Private Sub BuildPlanningFailure(command As String, status As String, outcome As JSONItem)
+    Dim report As JSONItem = JSONItem.NewObject()
+    report.Value("schema") = 1
+    report.Value("command") = command
+    report.Value("phase") = "planning"
+    report.Value("complete") = False
+    report.Value("status") = status
+    report.Value("diagnostic") = outcome.Value("stderr")
+    report.Value("results") = JSONItem.NewArray()
+    Print Json.Stringify(report)
+End Sub
+
+''' Execute shared build plans with native process-tree supervision.
+''' Recipe policy lives in the shipped Python helper during the migration.
+Public Function DevBuild(command As String, arguments As Array Of String, planOnly As Boolean, listOnly As Boolean, explain As Boolean, reportFile As String, cancelFile As String, deadlineSeconds As Double) As Integer
+    DevNeed(deadlineSeconds > 0.0 And deadlineSeconds < Double.Infinity, "deadline must be positive and finite")
+    Dim deadline As Double = System.Microseconds() / 1000000.0 + deadlineSeconds
+    Dim executable As FileSystemItem = FileSystemItem.ExecutableFile()
+    DevNeed(executable <> Nil, "cannot locate ahoy executable")
+    Dim helper As String = DevEnvironment("BUOY_DEV_BUILD_HELPER", Path.Join(executable.ParentPath(), "buoy-build/buoy_build.py"))
+    DevNeed(DevIsFile(helper), "build helper is missing; rebuild ahoy or set BUOY_DEV_BUILD_HELPER")
+    helper = DevAbsolute(helper)
+    Dim python As String = DevEnvironment("BUOY_DEV_PYTHON", DevWhich("python3"))
+    If python = "" Then python = DevWhich("python")
+    DevNeed(python <> "", "build commands currently require Python 3.10+")
+    Dim argv As Array Of String = []
+    For Each part As String In [python, "-B", helper, "plan", command, "--executor", executable.FullPath()]
+        Array.Append(argv, part)
+    Next
+    For Each argument As String In arguments
+        Array.Append(argv, argument)
+    Next
+    Dim planned As JSONItem = DevExecute(argv, DevCwd(), deadlineSeconds, 16777216, Nil, deadline, cancelFile)
+    If planned.Value("cancelled").AsBoolean().Or(False) Then
+        BuildPlanningFailure(command, "cancelled", planned)
+        Return 3
+    End If
+    If planned.Value("timeout").AsBoolean().Or(False) Then
+        StdErr.WriteLine("build planning timed out")
+        BuildPlanningFailure(command, "timeout", planned)
+        Return 1
+    End If
+    If DevNumber(planned.Value("returncode"), 1.0) <> 0 Or planned.Value("truncated").AsBoolean().Or(False) Or planned.Value("timeout").AsBoolean().Or(False) Then
+        StdErr.Write(DevString(planned.Value("stderr")))
+        BuildPlanningFailure(command, "invalid", planned)
+        Return 2
+    End If
+    Dim plan As JSONItem = DevParse(DevString(planned.Value("stdout")), True)
+    Dim root As String = DevAbsolute(DevString(plan.Value("root")))
+    Dim actions As JSONItem = plan.Value("actions")
+    Dim environment As New Map Of String, String()
+    If plan.HasKey("compiler") Then environment.Set("BUOY", DevString(plan.Value("compiler")))
+    If plan.HasKey("packager") Then environment.Set("BPM_PACKAGER", DevString(plan.Value("packager")))
+    If listOnly Then
+        For Each name As String In DevStrings(plan.Value("recipes"))
+            Print name
+        Next
+        Return 0
+    End If
+    If planOnly Then
+        plan.Value("complete") = True
+        plan.Value("status") = "planned"
+        If reportFile <> "" Then DevWrite(reportFile, Json.Stringify(plan))
+        Print Json.Stringify(plan)
+        Return 0
+    End If
+    Dim lock As New BuildLock()
+    Dim status As Integer = 0
+    Dim results As JSONItem = JSONItem.NewArray()
+    Try
+        status = lock.Acquire(python, helper, root, deadline, cancelFile)
+        If status <> 0 Then
+            plan.Value("results") = results
+            plan.Value("phase") = "lock"
+            plan.Value("status") = "locked"
+            If status = 1 Then plan.Value("status") = "timeout"
+            If status = 3 Then plan.Value("status") = "cancelled"
+            If reportFile <> "" Then DevWrite(reportFile, Json.Stringify(plan))
+            Print Json.Stringify(plan)
+            Return status
+        End If
+        For index As Integer = 0 To actions.Count() - 1
+            Dim action As JSONItem = actions.ValueAt(index)
+            Dim entry As JSONItem = JSONItem.NewObject()
+            entry.Value("name") = DevString(action.Value("name"))
+            entry.Value("kind") = DevString(action.Value("kind"))
+            entry.Value("outputs") = action.Value("outputs")
+            If action.HasKey("retained_outputs") Then entry.Value("retained_outputs") = action.Value("retained_outputs")
+            If action.HasKey("clean_outputs") Then entry.Value("clean_outputs") = action.Value("clean_outputs")
+            entry.Value("reason") = action.Value("reason")
+            entry.Value("status") = "not_run"
+            results.Add(entry)
+            If status <> 0 Then Continue For
+            If explain Then StdErr.WriteLine(DevString(action.Value("name")) + ": " + DevString(action.Value("reason")))
+            Dim prepared As Boolean = False
+            Try
+                Dim outcome As JSONItem
+                If action.HasKey("prepare_argv") Then
+                    outcome = DevExecute(DevStrings(action.Value("prepare_argv")), root, 30.0, 1048576, environment, deadline, cancelFile)
+                    If DevNumber(outcome.Value("returncode"), 1.0) <> 0 Or outcome.Value("timeout").AsBoolean().Or(False) Or outcome.Value("cancelled").AsBoolean().Or(False) Then
+                        entry.Value("prepare") = outcome
+                        status = 1
+                    End If
+                    prepared = status = 0
+                End If
+                If status = 0 Then
+                    outcome = DevExecute(DevStrings(action.Value("argv")), root, DevNumber(action.Value("timeout"), 600.0), 1048576, environment, deadline, cancelFile)
+                    entry.Value("execution") = outcome
+                    StdErr.Write(DevString(outcome.Value("stdout")))
+                    StdErr.Write(DevString(outcome.Value("stderr")))
+                End If
+                entry.Value("status") = "passed"
+                If command = "check" Then entry.Value("status") = "checked"
+                If outcome.Value("cancelled").AsBoolean().Or(False) Then
+                    entry.Value("status") = "cancelled"
+                    status = 3
+                ElseIf outcome.Value("timeout").AsBoolean().Or(False) Then
+                    entry.Value("status") = "timeout"
+                    status = 1
+                ElseIf status <> 0 Or DevNumber(outcome.Value("returncode"), 1.0) <> 0 Then
+                    entry.Value("status") = "failed"
+                    status = 1
+                End If
+                If status = 0 And action.HasKey("record_argv") Then
+                    outcome = DevExecute(DevStrings(action.Value("record_argv")), root, 60.0, 1048576, environment, deadline, cancelFile)
+                    entry.Value("verification") = outcome
+                    If DevNumber(outcome.Value("returncode"), 1.0) <> 0 Or outcome.Value("timeout").AsBoolean().Or(False) Or outcome.Value("cancelled").AsBoolean().Or(False) Then
+                        entry.Value("status") = "failed"
+                        status = 1
+                        If outcome.Value("timeout").AsBoolean().Or(False) Then entry.Value("status") = "timeout"
+                        If outcome.Value("cancelled").AsBoolean().Or(False) Then
+                            entry.Value("status") = "cancelled"
+                            status = 3
+                        End If
+                        StdErr.Write(DevString(outcome.Value("stderr")))
+                    End If
+                End If
+            Catch e As Exception
+                entry.Value("status") = "error"
+                entry.Value("error") = e.Message
+                status = 1
+            End Try
+            If status <> 0 And prepared And action.HasKey("failure_argv") Then
+                Try
+                    entry.Value("recovery") = DevExecute(DevStrings(action.Value("failure_argv")), root, 30.0, 1048576, environment)
+                Catch recoveryError As Exception
+                    entry.Value("recovery_error") = recoveryError.Message
+                End Try
+            End If
+        Next
+        plan.Value("results") = results
+        plan.Value("complete") = True
+        plan.Value("status") = "passed"
+        If status = 1 Then plan.Value("status") = "failed"
+        If status = 3 Then plan.Value("status") = "cancelled"
+        If reportFile <> "" Then DevWrite(reportFile, Json.Stringify(plan))
+        Print Json.Stringify(plan)
+    Finally
+        lock.Close()
+    End Try
+    Return status
+End Function

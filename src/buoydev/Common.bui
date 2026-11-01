@@ -1,0 +1,797 @@
+Import processkit
+Import regex.Regex
+
+Private Declare Function D_SyncFile Lib "buoy_processkit" Alias "bpk_sync_file" (filename As String) As Integer
+
+#If TargetWindows Then
+Private Declare Function D_GetCwdW Lib "kernel32" Alias "GetCurrentDirectoryW" (size As UInt32, buffer As Ptr) As UInt32
+Private Declare Function D_FullPathW Lib "kernel32" Alias "GetFullPathNameW" (filename As Ptr, size As UInt32, buffer As Ptr, part As Ptr) As UInt32
+Private Declare Function D_MkdirW Lib "kernel32" Alias "CreateDirectoryW" (filename As Ptr, attributes As Ptr) As Int32
+Private Declare Function D_DeleteW Lib "kernel32" Alias "DeleteFileW" (filename As Ptr) As Int32
+Private Declare Function D_RmdirW Lib "kernel32" Alias "RemoveDirectoryW" (filename As Ptr) As Int32
+Private Declare Function D_Attributes Lib "kernel32" Alias "GetFileAttributesW" (filename As Ptr) As UInt32
+Private Declare Function D_Move Lib "kernel32" Alias "MoveFileExW" (source As Ptr, destination As Ptr, openFlags As UInt32) As Int32
+Private Declare Function D_CreateW Lib "kernel32" Alias "CreateFileW" (filename As Ptr, access As UInt32, sharing As UInt32, security As Ptr, creation As UInt32, attributes As UInt32, template As Integer) As Integer
+Private Declare Function D_Write Lib "kernel32" Alias "WriteFile" (handle As Integer, data As Ptr, size As UInt32, ByRef written As UInt32, overlapped As Ptr) As Int32
+Private Declare Function D_Close Lib "kernel32" Alias "CloseHandle" (handle As Integer) As Int32
+Private Declare Function D_GetEnvW Lib "kernel32" Alias "GetEnvironmentVariableW" (name As Ptr, buffer As Ptr, size As UInt32) As UInt32
+Private Declare Function D_LastError Lib "kernel32" Alias "GetLastError" () As UInt32
+Private Declare Sub D_SetError Lib "kernel32" Alias "SetLastError" (code As UInt32)
+Public Declare Sub DevExit Lib "msvcrt" Alias "exit" (status As Int32)
+#Else
+Private Declare Function D_GetCwd Lib "c" Alias "getcwd" (buffer As Ptr, size As UInt64) As String
+Private Declare Function D_RealPath Lib "c" Alias "realpath" (filename As String, buffer As Ptr) As String
+Private Declare Function D_Mkdir Lib "c" Alias "mkdir" (filename As String, mode As UInt32) As Int32
+Private Declare Function D_ReadLink Lib "c" Alias "readlink" (filename As String, buffer As Ptr, size As UInt64) As Integer
+Private Declare Function D_Unlink Lib "c" Alias "unlink" (filename As String) As Int32
+Public Declare Sub DevExit Lib "c" Alias "exit" (status As Int32)
+#End If
+
+Public Sub DevNeed(passed As Boolean, message As String)
+    If Not passed Then Throw New InvalidArgumentException(message)
+End Sub
+
+Public Function DevExact(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+Public Function DevPathsEqual(a As String, b As String) As Boolean
+    Dim leftPath As String = DevAbsolute(a)
+    Dim rightPath As String = DevAbsolute(b)
+    #If TargetLinux Then
+        Return DevExact(leftPath, rightPath)
+    #Else
+        ' Keep conservative alias rejection on Windows and default macOS volumes.
+        Return DevExact(String.LCase(leftPath), String.LCase(rightPath))
+    #End If
+End Function
+
+Public Function DevHas(values As Array Of String, value As String) As Boolean
+    For Each entry As String In values
+        If DevExact(entry, value) Then Return True
+    Next
+    Return False
+End Function
+
+Public Function DevString(value As JSONItem, label As String = "value") As String
+    DevNeed(value.IsString(), label + ": expected string")
+    Return value.AsString().Value
+End Function
+
+Public Function DevNumber(value As JSONItem, fallback As Double) As Double
+    If value.IsNull() Then Return fallback
+    DevNeed(value.IsNumber(), "expected number")
+    Return value.AsNumber().Value
+End Function
+
+Public Function DevStrings(value As JSONItem) As Array Of String
+    DevNeed(value.IsArray(), "expected array of strings")
+    Dim outcome As Array Of String = []
+    For i As Integer = 0 To value.Count() - 1
+        Array.Append(outcome, DevString(value.ValueAt(i)))
+    Next
+    Return outcome
+End Function
+
+Public Function DevArray(values As Array Of String) As JSONItem
+    Dim outcome As JSONItem = JSONItem.NewArray()
+    For Each value As String In values
+        outcome.Add(value)
+    Next
+    Return outcome
+End Function
+
+Public Function DevLines(source As String) As Array Of String
+    Return String.Split(String.Replace(String.Replace(source, "\r\n", "\n"), "\r", "\n"), "\n")
+End Function
+
+' Validate structure and duplicate decoded keys before the stdlib can discard them.
+Private Class StrictJSONReader
+    ' JSON syntax is ASCII. Scan byte offsets, then decode complete string
+    ' tokens, so UTF-8 prefixes are not rescanned for each character.
+    Public Property Source As String
+    Public Property Offset As Integer = 0
+    Public Property Raw As Bytes
+    Public Property Length As Integer = 0
+    Public Property IntegerSchema As Boolean = False
+
+    Private Function Slice(start As Integer, count As Integer) As String
+        Dim chunk As New Bytes()
+        DevNeed(start >= 0 And count >= 0 And start + count <= Length, "incomplete JSON token")
+        If count > 0 Then chunk.Append(CType(CType(Raw.DataPtr(), Integer) + start, Ptr), count)
+        Return chunk.ToString(Text.Encodings.UTF8)
+    End Function
+
+    Private Function Peek() As String
+        If Offset >= Length Then Return ""
+        Return String.Chr(Raw.Item(Offset))
+    End Function
+
+    Private Sub Space()
+        While Offset < Length
+            Dim octet As Integer = Raw.Item(Offset)
+            If octet <> 32 And octet <> 9 And octet <> 13 And octet <> 10 Then Exit While
+            Offset += 1
+        End While
+    End Sub
+
+    Private Function Take() As String
+        DevNeed(Offset < Length, "unexpected end of JSON")
+        Dim ch As String = Me.Peek()
+        Offset += 1
+        Return ch
+    End Function
+
+    Private Function StringValue() As String
+        Dim start As Integer = Offset
+        DevNeed(Me.Take() = "\"", "expected JSON string")
+        While Offset < Length
+            Dim ch As String = Me.Take()
+            If ch = "\"" Then
+                Dim token As String = Me.Slice(start, Offset - start)
+                Return DevString(Json.Parse(token))
+            End If
+            DevNeed(Raw.Item(Offset - 1) >= 32, "control character in JSON string")
+            If ch = "\\" Then
+                Dim escaped As String = Me.Take()
+                DevNeed(DevHas(["\"", "\\", "/", "b", "f", "n", "r", "t", "u"], escaped), "invalid JSON escape")
+                If escaped = "u" Then
+                    DevNeed(Offset + 4 <= Length, "incomplete Unicode escape")
+                    Dim hex As String = Me.Slice(Offset, 4)
+                    DevNeed(DevMatch(hex, "^[0-9a-fA-F]{4}$"), "invalid Unicode escape")
+                    DevNeed(hex <> "0000", "NUL is unsupported by Buoy strings")
+                    Offset += 4
+                    If DevMatch(hex, "^[dD][89aAbB][0-9a-fA-F]{2}$") Then
+                        DevNeed(Offset + 2 <= Length And DevExact(Me.Slice(Offset, 2), "\\u"), "unpaired Unicode surrogate")
+                        Offset += 2
+                        Dim low As String = Me.Slice(Offset, 4)
+                        DevNeed(DevMatch(low, "^[dD][c-fC-F][0-9a-fA-F]{2}$"), "unpaired Unicode surrogate")
+                        Offset += 4
+                    Else
+                        DevNeed(Not DevMatch(hex, "^[dD][c-fC-F][0-9a-fA-F]{2}$"), "unpaired Unicode surrogate")
+                    End If
+                End If
+            End If
+        End While
+        Throw New InvalidArgumentException("unterminated JSON string")
+    End Function
+
+    Public Function Value(depth As Integer = 0) As JSONItem
+        DevNeed(depth <= 128, "JSON nesting exceeds 128")
+        Me.Space()
+        Dim ch As String = Me.Peek()
+        If ch = "\"" Then Return JSONItem.From(Me.StringValue())
+        If ch = "{" Or ch = "[" Then
+            Offset += 1
+            Dim objectMode As Boolean = ch = "{"
+            Dim closing As String = "]"
+            Dim outcome As JSONItem = JSONItem.NewArray()
+            If objectMode Then
+                closing = "}"
+                outcome = JSONItem.NewObject()
+            End If
+            Me.Space()
+            If Me.Peek() = closing Then
+                Offset += 1
+                Return outcome
+            End If
+            Dim keys As Array Of String = []
+            Do
+                Me.Space()
+                Dim key As String = ""
+                If objectMode Then
+                    key = Me.StringValue()
+                    DevNeed(Not DevHas(keys, key), "duplicate JSON key: " + key)
+                    Array.Append(keys, key)
+                    Me.Space()
+                    DevNeed(Me.Take() = ":", "expected JSON colon")
+                End If
+                Me.Space()
+                Dim valueStart As Integer = Offset
+                Dim child As JSONItem = Me.Value(depth + 1)
+                If IntegerSchema And depth = 0 And objectMode And DevExact(key, "schema") And child.IsNumber() Then
+                    DevNeed(DevMatch(Me.Slice(valueStart, Offset - valueStart), "\\A-?(0|[1-9][0-9]*)\\z"), "schema must be an integer literal")
+                End If
+                If objectMode Then
+                    outcome.Value(key) = child
+                Else
+                    outcome.Add(child)
+                End If
+                Me.Space()
+                Dim delimiter As String = Me.Take()
+                If delimiter = closing Then Return outcome
+                DevNeed(delimiter = ",", "expected JSON comma")
+            Loop
+        End If
+        Dim start As Integer = Offset
+        While Offset < Length
+            ch = Me.Peek()
+            If DevHas([" ", "\t", "\r", "\n", ",", "]", "}"], ch) Then Exit While
+            Offset += 1
+        End While
+        Dim token As String = Me.Slice(start, Offset - start)
+        DevNeed(DevExact(token, "true") Or DevExact(token, "false") Or DevExact(token, "null") Or DevMatch(token, "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?$"), "invalid JSON value")
+        Return Json.Parse(token)
+    End Function
+
+    Public Function Parse() As JSONItem
+        Dim outcome As JSONItem = Me.Value()
+        Me.Space()
+        DevNeed(Offset = Length, "trailing JSON content")
+        Return outcome
+    End Function
+End Class
+
+Public Function DevParse(source As String, integerSchema As Boolean = False) As JSONItem
+    DevNeed(String.LenBytes(source) <= 16777216, "JSON exceeds 16 MiB")
+    Dim reader As New StrictJSONReader()
+    reader.Source = source
+    reader.Raw = Bytes.FromString(source, Text.Encodings.UTF8)
+    reader.Length = reader.Raw.Count
+    reader.IntegerSchema = integerSchema
+    Return reader.Parse()
+End Function
+
+Public Function DevRead(filename As String) As String
+    Dim file As New FileSystemItem(filename)
+    DevNeed(file.Length() <= 16777216, "input exceeds 16 MiB: " + filename)
+    Dim read As Result Of String, String = file.ReadAllText()
+    If read.IsErr Then Throw New IOException("cannot read " + filename + ": " + read.Error)
+    Dim raw As Bytes = Bytes.FromString(read.Value, Text.Encodings.UTF8)
+    DevNeed(raw.Count = file.Length(), "NUL or incomplete input: " + filename)
+    Return raw.ToString(Text.Encodings.UTF8)
+End Function
+
+Public Function DevLoad(filename As String, integerSchema As Boolean = False) As JSONItem
+    Return DevParse(DevRead(filename), integerSchema)
+End Function
+
+Public Sub DevMkdir(filename As String)
+    Dim folder As New FileSystemItem(filename)
+    DevNeed(folder.CreateFolder(True), "cannot create directory: " + filename)
+End Sub
+
+Public Function DevClaimDirectory(filename As String) As Boolean
+    #If TargetWindows Then
+        Dim wide As Bytes = WidePath(filename)
+        Return D_MkdirW(wide.DataPtr(), Nil) <> 0
+    #Else
+        Return D_Mkdir(filename, 448) = 0
+    #End If
+End Function
+
+Public Function DevCwd() As String
+    #If TargetWindows Then
+        Dim buffer As New Bytes(65536)
+        Dim count As Integer = D_GetCwdW(32768, buffer.DataPtr())
+        DevNeed(count > 0 And count < 32768, "cannot read current directory")
+        Dim data As New Bytes()
+        data.Append(buffer.DataPtr(), count * 2)
+        Dim outcome As String = data.ToString(Text.Encodings.UTF16LE)
+    #Else
+        Dim buffer As New Bytes(32768)
+        Dim outcome As String = D_GetCwd(buffer.DataPtr(), 32768)
+    #End If
+    DevNeed(outcome <> "", "cannot read current directory")
+    Return outcome
+End Function
+
+Public Function DevAbsolute(filename As String) As String
+    DevNeed(filename <> "", "empty path")
+    Dim pathText As String = String.Replace(filename, "\\", "/")
+    #If TargetWindows Then
+        Dim buffer As New Bytes(65536)
+        Dim wide As Bytes = WidePath(pathText)
+        Dim count As Integer = D_FullPathW(wide.DataPtr(), 32768, buffer.DataPtr(), Nil)
+        DevNeed(count > 0 And count < 32768, "cannot resolve path: " + filename)
+        Dim data As New Bytes()
+        data.Append(buffer.DataPtr(), count * 2)
+        Dim outcome As String = data.ToString(Text.Encodings.UTF16LE)
+        Return String.Replace(outcome, "\\", "/")
+    #Else
+        If Not String.StartsWith(pathText, "/", True) Then pathText = Path.Join(DevCwd(), pathText)
+        Dim parts As Array Of String = []
+        For Each part As String In String.Split(pathText, "/")
+            If part = "" Or part = "." Then Continue For
+            If part = ".." Then
+                If Array.Count(parts) > 0 Then Array.RemoveAt(parts, Array.Count(parts) - 1)
+            Else
+                Array.Append(parts, part)
+            End If
+        Next
+        pathText = "/" + String.Join(parts, "/")
+        Dim item As New FileSystemItem(pathText)
+        If item.Exists() Then
+            Dim buffer As New Bytes(32768)
+            Dim resolved As String = D_RealPath(pathText, buffer.DataPtr())
+            DevNeed(resolved <> "", "cannot resolve path: " + pathText)
+            Return resolved
+        End If
+        If item.Parent <> Nil Then Return Path.Join(DevAbsolute(item.ParentPath()), item.Name())
+        Return pathText
+    #End If
+End Function
+
+Private Function WidePath(value As String) As Bytes
+    Dim data As Bytes = Bytes.FromString(value, Text.Encodings.UTF16LE)
+    data.Append(0)
+    data.Append(0)
+    Return data
+End Function
+
+Public Function DevIsFile(filename As String) As Boolean
+    #If TargetWindows Then
+        Dim wide As Bytes = WidePath(filename)
+        Dim attributes As UInt32 = D_Attributes(wide.DataPtr())
+        Return attributes <> 4294967295 And (attributes And 16) = 0
+    #Else
+        Return New FileSystemItem(filename).IsFile()
+    #End If
+End Function
+
+Public Function DevEnvironment(name As String, fallback As String = "") As String
+    #If TargetWindows Then
+        Dim key As Bytes = WidePath(name)
+        Dim buffer As New Bytes(65536)
+        D_SetError(0)
+        Dim count As UInt32 = D_GetEnvW(key.DataPtr(), buffer.DataPtr(), 32768)
+        If count = 0 Then
+            If D_LastError() = 203 Then Return fallback
+            Return ""
+        End If
+        DevNeed(count < 32768, "environment value is too large: " + name)
+        Dim value As New Bytes()
+        value.Append(buffer.DataPtr(), count * 2)
+        Return value.ToString(Text.Encodings.UTF16LE)
+    #Else
+        Return System.EnvironmentVariable(name).Or(fallback)
+    #End If
+End Function
+
+Public Function DevIsLink(filename As String) As Boolean
+    #If TargetWindows Then
+        Dim wide As Bytes = WidePath(filename)
+        Dim attributes As UInt32 = D_Attributes(wide.DataPtr())
+        Return attributes <> 4294967295 And (attributes And 1024) <> 0
+    #Else
+        Dim buffer As New Bytes(1)
+        Return D_ReadLink(filename, buffer.DataPtr(), 1) >= 0
+    #End If
+End Function
+
+Public Function DevTemp(prefix As String, parent As String = "") As String
+    If parent = "" Then
+        parent = DevEnvironment("TMPDIR")
+        If parent = "" Then parent = DevEnvironment("TEMP")
+        If parent = "" Then
+            Dim location As FileSystemItem = System.Folders.Temporary(System.FolderDomains.User)
+            DevNeed(location <> Nil, "temporary directory unavailable")
+            parent = location.FullPath()
+        End If
+    End If
+    parent = DevAbsolute(parent)
+    For attempt As Integer = 0 To 99
+        Dim candidate As String = Path.Join(parent, prefix + Str(Random.RandomInteger(1, 9223372036854775806)))
+        #If TargetWindows Then
+            Dim wide As Bytes = WidePath(candidate)
+            If D_MkdirW(wide.DataPtr(), Nil) <> 0 Then Return candidate
+        #Else
+            Dim made As Integer = D_Mkdir(candidate, 448)
+            If made = 0 Then Return candidate
+        #End If
+    Next
+    Throw New IOException("cannot create temporary directory in " + parent)
+End Function
+
+Public Sub DevRemoveTree(filename As String)
+    Dim item As New FileSystemItem(filename)
+    DevNeed(item.Parent <> Nil And Not DevIsLink(filename), "invalid cleanup root")
+    DeleteNode(item)
+End Sub
+
+Private Sub DeleteNode(item As FileSystemItem)
+    If DevIsLink(item.FullPath()) Then
+        #If TargetWindows Then
+            Dim wide As Bytes = WidePath(item.FullPath())
+            Dim attributes As UInt32 = D_Attributes(wide.DataPtr())
+            Dim removed As Integer
+            If (attributes And 16) <> 0 Then
+                removed = D_RmdirW(wide.DataPtr())
+            Else
+                removed = D_DeleteW(wide.DataPtr())
+            End If
+            DevNeed(removed <> 0, "cannot remove temporary link")
+        #Else
+            DevNeed(D_Unlink(item.FullPath()) = 0, "cannot remove temporary link")
+        #End If
+        Exit Sub
+    End If
+    Dim directory As Boolean = item.IsFolder()
+    #If TargetWindows Then
+        Dim pathWide As Bytes = WidePath(item.FullPath())
+        Dim attributes As UInt32 = D_Attributes(pathWide.DataPtr())
+        DevNeed(attributes <> 4294967295, "cannot inspect temporary input: " + item.FullPath())
+        directory = (attributes And 16) <> 0
+    #End If
+    If directory Then
+        For Each child As FileSystemItem In item.Children()
+            DeleteNode(child)
+        Next
+    End If
+    #If TargetWindows Then
+        Dim removed As Integer
+        If directory Then
+            removed = D_RmdirW(pathWide.DataPtr())
+        Else
+            removed = D_DeleteW(pathWide.DataPtr())
+        End If
+        DevNeed(removed <> 0, "cannot clean temporary input: " + item.FullPath())
+    #Else
+        DevNeed(item.Delete(), "cannot clean temporary input: " + item.FullPath())
+    #End If
+End Sub
+
+Public Function DevCompilerBuild(compiler As String, source As String, output As String) As Array Of String
+    Dim argv As Array Of String = Array.AsResizable([compiler, source, "-o", output])
+    #If TargetWindows Then
+        Dim triple As String = "x86_64-pc-windows-msvc"
+        #If TargetArm Then
+            triple = "arm64-pc-windows-msvc"
+        #End If
+        Dim executable As New FileSystemItem(DevWhich(compiler))
+        Dim runtime As String = Path.Join(executable.ParentPath(), "lib/runtime/" + triple)
+        If New FileSystemItem(runtime).IsFolder() Then
+            Array.Append(argv, "-L")
+            Array.Append(argv, runtime)
+        End If
+    #End If
+    Return argv
+End Function
+
+Public Sub DevDeployCompilerRuntime(compiler As String, directory As String)
+    #If TargetWindows Then
+        Dim triple As String = "x86_64-pc-windows-msvc"
+        #If TargetArm Then
+            triple = "arm64-pc-windows-msvc"
+        #End If
+        Dim executable As New FileSystemItem(DevWhich(compiler))
+        Dim runtime As New FileSystemItem(Path.Join(executable.ParentPath(), "lib/runtime/" + triple))
+        If Not runtime.IsFolder() Then Exit Sub
+        For Each library As FileSystemItem In runtime.Children()
+            If library.IsFile() And String.EndsWith(library.Name(), ".dll", True) Then
+                Dim destination As New FileSystemItem(Path.Join(directory, library.Name()))
+                If Not destination.Exists() Then DevNeed(library.CopyTo(destination), "cannot deploy compiler runtime: " + library.Name())
+            End If
+        Next
+    #End If
+End Sub
+
+Public Sub DevWrite(filename As String, content As String)
+    Dim destination As New FileSystemItem(DevAbsolute(filename))
+    Dim existingMode As Integer = -1
+    If destination.Exists() Then
+        DevNeed(destination.IsFile(), "output is not a regular file: " + filename)
+        existingMode = destination.Permissions.Mode And &o777
+        DevNeed((existingMode And &o222) <> 0, "output is read-only: " + filename)
+    End If
+    DevMkdir(destination.ParentPath())
+    Dim temporary As String = DevTemp(".buoy-write-", destination.ParentPath())
+    Try
+        Dim file As New FileSystemItem(Path.Join(temporary, "content"))
+        #If TargetWindows Then
+            Dim filenameWide As Bytes = WidePath(file.FullPath())
+            Dim handle As Integer = D_CreateW(filenameWide.DataPtr(), 1073741824, 0, Nil, 2, 128, 0)
+            DevNeed(handle <> -1, "cannot create output: " + filename)
+            Try
+                Dim raw As Bytes = Bytes.FromString(content, Text.Encodings.UTF8)
+                Dim written As UInt32 = 0
+                If raw.Count > 0 Then DevNeed(D_Write(handle, raw.DataPtr(), raw.Count, written, Nil) <> 0 And written = raw.Count, "cannot write output: " + filename)
+            Finally
+                DevNeed(D_Close(handle) <> 0, "cannot close output: " + filename)
+            End Try
+        #Else
+            Dim written As Result Of Integer, String = file.WriteAllText(content)
+            If written.IsErr Then Throw New IOException(written.Error)
+        #End If
+        If existingMode >= 0 Then file.Permissions.Mode = existingMode
+        DevNeed(D_SyncFile(file.FullPath()) <> 0, "cannot synchronize output")
+        #If TargetWindows Then
+            Dim sourceWide As Bytes = WidePath(file.FullPath())
+            Dim destinationWide As Bytes = WidePath(destination.FullPath())
+            DevNeed(D_Move(sourceWide.DataPtr(), destinationWide.DataPtr(), 9) <> 0, "cannot replace output: " + filename)
+        #Else
+            DevNeed(file.MoveTo(destination), "cannot replace output: " + filename)
+        #End If
+    Finally
+        DevRemoveTree(temporary)
+    End Try
+End Sub
+
+Public Function DevProjectPath(root As String, relative As String) As String
+    root = DevAbsolute(root)
+    Dim absolute As String = DevAbsolute(Path.Join(root, relative))
+    #If TargetWindows Then
+        DevNeed(String.StartsWith(String.LCase(absolute), String.LCase(root) + "/", True), "path leaves project: " + relative)
+    #Else
+        DevNeed(String.StartsWith(absolute, root + "/", True), "path leaves project: " + relative)
+    #End If
+    Return absolute
+End Function
+
+Public Function DevGlob(value As String, pattern As String) As Boolean
+    Dim regex As String = "\\A"
+    Dim index As Integer = 0
+    While index < String.Len(pattern)
+        Dim ch As String = String.Substring(pattern, index, 1)
+        Select Case ch
+        Case "*"
+            regex += "[\\s\\S]*"
+        Case "?"
+            regex += "[\\s\\S]"
+        Case "["
+            Dim ending As Integer = String.IndexOf(pattern, "]", index + 1, True)
+            If ending > index + 1 Then
+                Dim part As String = String.Substring(pattern, index + 1, ending - index - 1)
+                If String.StartsWith(part, "!", True) Then part = "^" + String.Substring(part, 1)
+                regex += "[" + part + "]"
+                index = ending
+            Else
+                regex += "\\["
+            End If
+        Case Else
+            If String.Contains(".()+^${}|\\]", ch, True) Then regex += "\\"
+            regex += ch
+        End Select
+        index += 1
+    End While
+    Return DevMatch(value, regex + "\\z")
+End Function
+
+Private Sub ExpandPattern(root As String, folder As String, parts As Array Of String, index As Integer, files As JSONItem)
+    If index = Array.Count(parts) Then
+        Dim item As New FileSystemItem(folder)
+        DevNeed(item.IsFile() And Not DevIsLink(folder), "expected regular file: " + folder)
+        Dim canonical As String = DevProjectPath(root, String.Substring(folder, String.Len(root) + 1))
+        If Not DevHas(DevStrings(files), canonical) Then files.Add(canonical)
+        Exit Sub
+    End If
+    Dim part As String = parts(index)
+    If part = "**" Then
+        ExpandPattern(root, folder, parts, index + 1, files)
+        Dim item As New FileSystemItem(folder)
+        For Each child As FileSystemItem In item.Children()
+            If child.IsFolder() And Not DevIsLink(child.FullPath()) Then ExpandPattern(root, child.FullPath(), parts, index, files)
+        Next
+        Exit Sub
+    End If
+    Dim parent As New FileSystemItem(folder)
+    For Each child As FileSystemItem In parent.Children()
+        If DevGlob(child.Name(), part) Then
+            DevNeed(Not DevIsLink(child.FullPath()), "symlink in staged inputs: " + child.FullPath())
+            If index = Array.Count(parts) - 1 Or child.IsFolder() Then ExpandPattern(root, child.FullPath(), parts, index + 1, files)
+        End If
+    Next
+End Sub
+
+Public Function DevFiles(root As String, patterns As JSONItem) As Array Of String
+    Dim files As JSONItem = JSONItem.NewArray()
+    For Each pattern As String In DevStrings(patterns)
+        DevNeed(pattern <> "" And Not String.StartsWith(pattern, "/", True) And Not String.Contains(pattern, ":", True) And Not String.Contains(pattern, "\\", True), "invalid project glob: " + pattern)
+        Dim parts As Array Of String = []
+        For Each part As String In String.Split(pattern, "/")
+            If part <> "" And part <> "." Then Array.Append(parts, part)
+        Next
+        DevNeed(Not DevHas(parts, ".."), "invalid project glob: " + pattern)
+        Dim matched As JSONItem = JSONItem.NewArray()
+        ExpandPattern(root, root, parts, 0, matched)
+        DevNeed(matched.Count() > 0, "no files matched: " + pattern)
+        For Each pathText As String In DevStrings(matched)
+            If Not DevHas(DevStrings(files), pathText) Then files.Add(pathText)
+        Next
+    Next
+    Dim outcome As Array Of String = DevStrings(files)
+    Array.Sort(outcome)
+    Return outcome
+End Function
+
+Private Function ExecutionPath(filename As String, directory As String) As String
+    Dim normalized As String = String.Replace(filename, "\\", "/")
+    Dim absolute As Boolean = String.StartsWith(normalized, "/", True)
+    #If TargetWindows Then
+        If String.Len(normalized) >= 2 Then
+            If String.Substring(normalized, 1, 1) = ":" Then absolute = True
+        End If
+    #End If
+    If Not absolute And directory <> "" Then normalized = Path.Join(directory, normalized)
+    Return DevAbsolute(normalized)
+End Function
+
+Public Function DevWhich(executable As String, workingDirectory As String = "") As String
+    If String.Contains(executable, "/", True) Or String.Contains(executable, "\\", True) Then
+        Dim file As New FileSystemItem(ExecutionPath(executable, workingDirectory))
+        If file.IsFile() Then Return file.FullPath()
+        Return ""
+    End If
+    Dim separator As String = ":"
+    Dim suffixes As Array Of String = [""]
+    #If TargetWindows Then
+        separator = ";"
+        suffixes = ["", ".exe", ".com"]
+    #End If
+    For Each directory As String In String.Split(DevEnvironment("PATH"), separator)
+        If directory = "" Then directory = "."
+        directory = ExecutionPath(directory, workingDirectory)
+        For Each suffix As String In suffixes
+            Dim file As New FileSystemItem(Path.Join(directory, executable + suffix))
+            If file.IsFile() Then
+                #If Not TargetWindows Then
+                    If (file.Permissions.Mode And 73) = 0 Then Continue For
+                #End If
+                Return DevAbsolute(file.FullPath())
+            End If
+        Next
+    Next
+    Return ""
+End Function
+
+Private Sub KeepLog(stored As Bytes, chunk As Bytes, limit As Integer, state As JSONItem, stream As String)
+    Dim count As Integer = Math.Min(chunk.Count, Math.Max(0, limit - stored.Count))
+    If count > 0 Then stored.Append(chunk.DataPtr(), count)
+    If count < chunk.Count Then
+        state.Value("truncated") = True
+        state.Value(stream + "_truncated") = True
+    End If
+End Sub
+
+Private Function LogText(data As Bytes) As String
+    ' Buoy strings cannot carry NUL; replace it before decoding to retain the tail.
+    Dim withoutNul As New Bytes()
+    For index As Integer = 0 To data.Count - 1
+        If data.Item(index) = 0 Then
+            withoutNul.Append(239)
+            withoutNul.Append(191)
+            withoutNul.Append(189)
+        Else
+            withoutNul.Append(data.Item(index))
+        End If
+    Next
+    data = withoutNul
+    Try
+        Return data.ToString(Text.Encodings.UTF8)
+    Catch e As EncodingException
+        ' Match replacement decoding, including a log cap splitting UTF-8.
+        Dim outcome As String = ""
+        Dim index As Integer = 0
+        While index < data.Count
+            Dim width As Integer = 1
+            Dim octet As Integer = data.Item(index)
+            If octet >= 194 And octet <= 223 Then width = 2
+            If octet >= 224 And octet <= 239 Then width = 3
+            If octet >= 240 And octet <= 244 Then width = 4
+            Dim part As New Bytes()
+            Dim available As Integer = Math.Min(width, data.Count - index)
+            For offset As Integer = 0 To available - 1
+                part.Append(data.Item(index + offset))
+            Next
+            Try
+                outcome += part.ToString(Text.Encodings.UTF8)
+                index += available
+            Catch bad As EncodingException
+                outcome += "�"
+                index += 1
+            End Try
+        End While
+        Return outcome
+    End Try
+End Function
+
+Public Function DevExecute(argv As Array Of String, cwd As String, timeout As Double, logLimit As Integer, environment As Map Of String, String, deadline As Double = 0.0, cancelFile As String = "") As JSONItem
+    DevNeed(Array.Count(argv) > 0, "executable is required")
+    DevNeed(timeout > 0.0 And timeout < Double.Infinity And logLimit > 0, "timeout and log limit must be positive and finite")
+    Dim executable As String = DevWhich(argv(0), cwd)
+    DevNeed(executable <> "", "executable not found: " + argv(0))
+    Dim arguments As Array Of String = []
+    For i As Integer = 1 To Array.Count(argv) - 1
+        Array.Append(arguments, argv(i))
+    Next
+    Dim started As Integer = System.Microseconds()
+    Dim child As PipeProcess
+    If environment = Nil Then environment = New Map Of String, String()
+    Dim outcome As JSONItem = JSONItem.NewObject()
+    outcome.Value("truncated") = False
+    outcome.Value("stdout_truncated") = False
+    outcome.Value("stderr_truncated") = False
+    Dim output As New Bytes()
+    Dim errors As New Bytes()
+    Dim timedOut As Boolean = deadline > 0.0 And System.Microseconds() / 1000000.0 >= deadline
+    Dim cancelled As Boolean = DevCancelled(cancelFile)
+    If timedOut Or cancelled Then
+        outcome.Value("returncode") = -1
+        outcome.Value("timeout") = timedOut
+        outcome.Value("cancelled") = cancelled
+        outcome.Value("stdout") = ""
+        outcome.Value("stderr") = ""
+        outcome.Value("seconds") = 0.0
+        Return outcome
+    End If
+    child = New PipeProcess(executable, arguments, cwd, environment, True)
+    Try
+        child.CloseInput()
+        Do
+            KeepLog(output, child.ReadOutput(), logLimit, outcome, "stdout")
+            KeepLog(errors, child.ReadError(), logLimit, outcome, "stderr")
+            Dim running As Boolean = child.Poll()
+            Dim elapsed As Double = (System.Microseconds() - started) / 1000000.0
+            cancelled = DevCancelled(cancelFile)
+            If elapsed >= timeout Or (deadline > 0.0 And System.Microseconds() / 1000000.0 >= deadline) Or cancelled Then
+                timedOut = Not cancelled
+                child.TerminateTree()
+                Exit Do
+            End If
+            If Not running And child.OutputClosed And child.ErrorClosed Then Exit Do
+            Sleep(1)
+        Loop
+        child.TerminateTree()
+        Dim cleanupStart As Integer = System.Microseconds()
+        Do
+            KeepLog(output, child.ReadOutput(), logLimit, outcome, "stdout")
+            KeepLog(errors, child.ReadError(), logLimit, outcome, "stderr")
+            Dim running As Boolean = child.Poll()
+            If Not running And child.OutputClosed And child.ErrorClosed Then Exit Do
+            If System.Microseconds() - cleanupStart > 2000000 Then Exit Do
+            Sleep(1)
+        Loop
+        Dim exitStatus As Integer = -1
+        If Not child.Poll() Then
+            exitStatus = child.ExitCode
+            If child.TerminationSignal > 0 Then exitStatus = -child.TerminationSignal
+        End If
+        outcome.Value("returncode") = exitStatus
+        outcome.Value("timeout") = timedOut
+        outcome.Value("cancelled") = cancelled
+        outcome.Value("stdout") = LogText(output)
+        outcome.Value("stderr") = LogText(errors)
+        Dim elapsed As Double = (System.Microseconds() - started) / 1000000.0
+        outcome.Value("seconds") = elapsed
+    Finally
+        child.Close()
+    End Try
+    Return outcome
+End Function
+
+Public Function DevExecute(argv As Array Of String, cwd As String, timeout As Double = 90.0, logLimit As Integer = 1048576) As JSONItem
+    Return DevExecute(argv, cwd, timeout, logLimit, Nil)
+End Function
+
+Public Function DevMatch(subject As String, pattern As String) As Boolean
+    Dim compiled As Result Of Regex, RegexError = Regex.Compile(pattern)
+    DevNeed(compiled.IsOk, "invalid regular expression")
+    Return compiled.Value.Find(subject).HasValue
+End Function
+
+Public Function DevCancelled(filename As String) As Boolean
+    If filename = "" Then Return False
+    #If TargetWindows Then
+        Dim wide As Bytes = WidePath(filename)
+        Return D_Attributes(wide.DataPtr()) <> 4294967295
+    #End If
+    Dim file As New FileSystemItem(filename)
+    Return file.Exists()
+End Function
+
+' Only star and question mark are special in new selection patterns.
+Public Function DevPattern(value As String, pattern As String) As Boolean
+    Dim expression As String = "\\A"
+    For i As Integer = 0 To String.Len(pattern) - 1
+        Dim ch As String = String.Substring(pattern, i, 1)
+        If ch = "*" Then
+            expression += "[\\s\\S]*"
+        ElseIf ch = "?" Then
+            expression += "[\\s\\S]"
+        Else
+            If String.Contains(".[]()+^$ {}|\\", ch, True) Then expression += "\\"
+            expression += ch
+        End If
+    Next
+    Return DevMatch(value, expression + "\\z")
+End Function

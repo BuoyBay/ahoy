@@ -1,0 +1,245 @@
+Import Common
+Import "Localization"
+Import xml.XML
+
+Const XliffNamespace As String = "urn:oasis:names:tc:xliff:document:2.0"
+Const XmlNamespace As String = "http://www.w3.org/XML/1998/namespace"
+Const XmlnsNamespace As String = "http://www.w3.org/2000/xmlns/"
+
+Private Function EscapeXML(value As String) As String
+    DevNeed(Not String.Contains(value, String.Chr(65534), True) And Not String.Contains(value, String.Chr(65535), True), "text cannot be represented in XML 1.0")
+    value = String.Replace(value, "&", "&amp;")
+    value = String.Replace(value, "<", "&lt;")
+    value = String.Replace(value, ">", "&gt;")
+    value = String.Replace(value, "\"", "&quot;")
+    Return String.Replace(value, "\r", "&#13;")
+End Function
+
+Private Sub CheckAttributeNamespaces(source As String)
+    ' The DOM attribute-name API returns local names, losing shadowing prefixes.
+    ' The streaming API exposes each attribute's actual namespace independently.
+    Dim reader As XMLReader = XMLReader.Open(source)
+    Try
+        While reader.Read()
+            If reader.Kind() <> XMLReader.NodeKinds.StartElement Then Continue While
+            Dim allowed As Array Of String = []
+            Select Case reader.Name()
+            Case "xliff"
+                allowed = ["version", "srcLang", "trgLang"]
+            Case "file"
+                allowed = ["id", "original"]
+            Case "unit"
+                allowed = ["id", "name", "canResegment"]
+            Case "note"
+                allowed = ["id", "category", "appliesTo", "priority"]
+            Case "segment"
+                allowed = ["id", "state"]
+            Case "source", "target"
+                allowed = ["xml:space", "xml:lang"]
+            End Select
+            For index As Integer = 0 To reader.AttributeCount() - 1
+                Dim uri As String = reader.AttributeNamespaceURI(index)
+                If DevExact(uri, XmlnsNamespace) Then Continue For
+                Dim name As String = reader.AttributeName(index)
+                If DevExact(uri, XmlNamespace) Then
+                    name = "xml:" + name
+                Else
+                    DevNeed(uri = "", "unsupported namespaced XLIFF attribute: " + name)
+                End If
+                DevNeed(DevHas(allowed, name), "unsupported XLIFF attribute: " + name)
+            Next
+        End While
+    Finally
+        reader.Close()
+    End Try
+End Sub
+
+Public Function LExportXliff(catalog As JSONItem, language As String) As String
+    DevNeed(DevHas(DevStrings(catalog.Value("languages")), language), "language must be declared in catalog")
+    Dim content As String = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xliff xmlns=\"" + XliffNamespace + "\" version=\"2.1\" srcLang=\"" + EscapeXML(DevString(catalog.Value("source_language"))) + "\" trgLang=\"" + EscapeXML(language) + "\">\n  <file id=\"buoy\">\n"
+    Dim messages As JSONItem = catalog.Value("messages")
+    DevNeed(messages.Count() <= 10000, "XLIFF exchange supports at most 10000 messages")
+    For index As Integer = 0 To messages.Count() - 1
+        Dim message As JSONItem = messages.ValueAt(index)
+        content += "    <unit id=\"" + EscapeXML(DevString(message.Value("id"))) + "\" canResegment=\"no\">\n"
+        Dim notes As String = message.Value("notes").AsString().Or("")
+        Dim locations As JSONItem = message.Value("locations")
+        If notes <> "" Or locations.Count() > 0 Then
+            content += "      <notes>\n"
+            If notes <> "" Then content += "        <note category=\"description\">" + EscapeXML(notes) + "</note>\n"
+            For i As Integer = 0 To locations.Count() - 1
+                content += "        <note category=\"location\">" + EscapeXML(DevString(locations.ValueAt(i))) + "</note>\n"
+            Next
+            content += "      </notes>\n"
+        End If
+        Dim translation As JSONItem = message.Value("translations").Value(language)
+        Dim state As String = "initial"
+        If Not translation.IsNull() Then
+            If DevExact(DevString(translation.Value("source")), DevString(message.Value("default"))) And DevString(translation.Value("state")) = "translated" Then state = "final"
+        End If
+        content += "      <segment id=\"s1\" state=\"" + state + "\">\n        <source xml:space=\"preserve\">" + EscapeXML(DevString(message.Value("default"))) + "</source>\n"
+        If Not translation.IsNull() Then content += "        <target xml:space=\"preserve\">" + EscapeXML(DevString(translation.Value("text"))) + "</target>\n"
+        content += "      </segment>\n    </unit>\n"
+    Next
+    Return content + "  </file>\n</xliff>\n"
+End Function
+
+Private Sub Attributes(node As XMLItem, allowed As Array Of String)
+    For Each name As String In node.AttributeNames()
+        If DevExact(name, "xmlns") Or String.StartsWith(name, "xmlns:", True) Then Continue For
+        If node.AttributeNS(name, XmlnsNamespace).HasValue Then Continue For
+        Dim qualified As String = name
+        If node.AttributeNS(name, XmlNamespace).HasValue Then
+            qualified = "xml:" + name
+        Else
+            DevNeed(node.Attribute(name).HasValue, "unsupported namespaced XLIFF attribute: " + name)
+        End If
+        DevNeed(DevHas(allowed, qualified), "unsupported XLIFF attribute: " + qualified)
+    Next
+End Sub
+
+Private Function ChildNodes(node As XMLItem) As Array Of XMLItem
+    Dim count As Integer = node.Count()
+    ' ChildAt repeatedly walks the DOM sibling list on large containers.
+    ' Fetch a large list in one XPath traversal, including non-element nodes.
+    If count > 64 Then Return node.SelectNodes("node()")
+    Dim children As Array Of XMLItem = []
+    For index As Integer = 0 To count - 1
+        Array.Append(children, node.ChildAt(index))
+    Next
+    Return children
+End Function
+
+Private Function Elements(node As XMLItem) As Array Of XMLItem
+    Dim children As Array Of XMLItem = []
+    For Each child As XMLItem In ChildNodes(node)
+        If child.IsElement() Then
+            DevNeed(DevExact(child.NamespaceURI(), XliffNamespace), "unsupported XLIFF extension namespace")
+            Array.Append(children, child)
+        ElseIf child.IsText() Then
+            DevNeed(String.Trim(child.Value) = "", "unexpected structural XLIFF text")
+        Else
+            DevNeed(child.IsComment() Or (node.IsDocument() And child.IsProcessingInstruction()), "unsupported XLIFF structural content")
+        End If
+    Next
+    Return children
+End Function
+
+Private Function PlainText(node As XMLItem, language As String) As String
+    Attributes(node, ["xml:space", "xml:lang"])
+    Dim xmlSpace As String = node.AttributeNS("space", XmlNamespace).Or("preserve")
+    DevNeed(DevExact(xmlSpace, "preserve"), "XLIFF source/target must preserve spaces")
+    Dim xmlLanguage As String = node.AttributeNS("lang", XmlNamespace).Or(language)
+    DevNeed(DevExact(xmlLanguage, language), "XLIFF text language disagrees with document")
+    Dim content As String = ""
+    For Each child As XMLItem In ChildNodes(node)
+        DevNeed(child.IsText() Or child.IsCData() Or child.IsComment(), "XLIFF inline markup is not supported")
+        If Not child.IsComment() Then content += child.Value
+    Next
+    DevNeed(Not DevMatch(content, "[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f]"), "unsupported control character in XLIFF text")
+    Return content
+End Function
+
+Public Function LImportXliff(catalog As JSONItem, language As String, source As String) As JSONItem
+    DevNeed(DevHas(DevStrings(catalog.Value("languages")), language), "language must be declared in catalog")
+    ' Reject DTDs even though native parsing disables external entity loading.
+    DevNeed(Not String.Contains(String.LCase(source), "<!doctype", True) And Not String.Contains(String.LCase(source), "<!entity", True), "XLIFF DTD/entity declarations are not supported")
+    Dim declarationText As String = source
+    If String.StartsWith(declarationText, String.Chr(65279), True) Then declarationText = String.Substring(declarationText, 1)
+    If String.StartsWith(declarationText, "<?xml ", True) Or String.StartsWith(declarationText, "<?xml\t", True) Or String.StartsWith(declarationText, "<?xml\n", True) Or String.StartsWith(declarationText, "<?xml\r", True) Then
+        Dim ending As Integer = String.IndexOf(declarationText, "?>")
+        DevNeed(ending >= 0 And ending <= 1024, "invalid XML declaration; XLIFF requires UTF-8 XML 1.0")
+        Dim declaration As String = String.Substring(declarationText, 0, ending + 2)
+        DevNeed(DevMatch(declaration, "\\A<\\?xml\\s+version\\s*=\\s*(\"1\\.0\"|'1\\.0')(\\s+encoding\\s*=\\s*(\"[uU][tT][fF]-8\"|'[uU][tT][fF]-8'))?(\\s+standalone\\s*=\\s*(\"(yes|no)\"|'(yes|no)'))?\\s*\\?>\\z"), "XLIFF requires UTF-8 XML 1.0")
+    End If
+    CheckAttributeNamespaces(source)
+    Dim options As New XMLParseOptions()
+    options.ExternalEntities = False
+    options.NamespaceAware = True
+    Dim document As XMLItem = XML.Parse(source, options)
+    Dim roots As Array Of XMLItem = Elements(document)
+    DevNeed(Array.Count(roots) = 1, "expected one XLIFF root")
+    Dim root As XMLItem = roots(0)
+    DevNeed(DevExact(root.Name(), "xliff"), "expected xliff root")
+    Attributes(root, ["version", "srcLang", "trgLang"])
+    DevNeed(DevHas(["2.0", "2.1"], root.Attribute("version").Or("")), "only XLIFF 2.0/2.1 core is supported")
+    Dim sourceLanguage As String = DevString(catalog.Value("source_language"))
+    DevNeed(DevExact(root.Attribute("srcLang").Or(""), sourceLanguage) And DevExact(root.Attribute("trgLang").Or(""), language), "XLIFF languages do not match catalog/import")
+    Dim files As Array Of XMLItem = Elements(root)
+    DevNeed(Array.Count(files) = 1, "XLIFF exchange requires exactly one file")
+    Dim file As XMLItem = files(0)
+    DevNeed(DevExact(file.Name(), "file") And file.Attribute("id").Or("") <> "", "XLIFF file id is required")
+    Attributes(file, ["id", "original"])
+    Dim units As Array Of XMLItem = Elements(file)
+    Dim messages As JSONItem = catalog.Value("messages")
+    DevNeed(Array.Count(units) = messages.Count() And messages.Count() <= 10000, "XLIFF must contain every current message")
+    Dim updated As JSONItem = DevParse(Json.Stringify(catalog))
+    Dim seen As New Map Of String, Boolean()
+    Dim indices As New Map Of String, Integer()
+    For index As Integer = 0 To messages.Count() - 1
+        indices.Set(String.LCase(DevString(messages.ValueAt(index).Value("id"))), index)
+    Next
+    For Each unit As XMLItem In units
+        DevNeed(DevExact(unit.Name(), "unit"), "unsupported XLIFF group or file content")
+        Attributes(unit, ["id", "name", "canResegment"])
+        DevNeed(DevHas(["yes", "no"], unit.Attribute("canResegment").Or("yes")), "invalid XLIFF canResegment")
+        Dim identity As String = unit.Attribute("id").Or("")
+        Dim key As String = String.LCase(identity)
+        DevNeed(identity <> "" And Not seen.ContainsKey(key), "missing or duplicate XLIFF unit id")
+        seen.Set(key, True)
+        Dim messageIndex As Integer = indices.Get(key).Or(-1)
+        DevNeed(messageIndex >= 0, "unknown XLIFF unit: " + identity)
+        Dim message As JSONItem = updated.Value("messages").ValueAt(messageIndex)
+        DevNeed(DevExact(DevString(message.Value("id")), identity), "unknown XLIFF unit: " + identity)
+        Dim children As Array Of XMLItem = Elements(unit)
+        Dim segment As XMLItem = Nil
+        Dim haveNotes As Boolean = False
+        For Each child As XMLItem In children
+            If DevExact(child.Name(), "notes") Then
+                DevNeed(Not haveNotes And segment = Nil, "duplicate or misplaced XLIFF notes")
+                haveNotes = True
+                Dim empty As Array Of String = []
+                Attributes(child, empty)
+                Dim notes As Array Of XMLItem = Elements(child)
+                DevNeed(Array.Count(notes) > 0, "XLIFF notes must not be empty")
+                For Each note As XMLItem In notes
+                    DevNeed(DevExact(note.Name(), "note"), "unsupported XLIFF notes content")
+                    Attributes(note, ["id", "category", "appliesTo", "priority"])
+                    If note.Attribute("appliesTo").HasValue Then DevNeed(DevHas(["source", "target"], note.Attribute("appliesTo").Value), "invalid XLIFF note appliesTo")
+                    If note.Attribute("priority").HasValue Then DevNeed(DevMatch(note.Attribute("priority").Value, "\\A([1-9]|10)\\z"), "invalid XLIFF note priority")
+                    For Each item As XMLItem In ChildNodes(note)
+                        DevNeed(item.IsText() Or item.IsCData() Or item.IsComment(), "inline note markup is unsupported")
+                    Next
+                Next
+            Else
+                DevNeed(DevExact(child.Name(), "segment") And segment = Nil, "only one XLIFF segment per unit is supported")
+                segment = child
+            End If
+        Next
+        DevNeed(segment <> Nil, "missing XLIFF segment")
+        Attributes(segment, ["id", "state"])
+        Dim state As String = segment.Attribute("state").Or("initial")
+        DevNeed(DevHas(["initial", "translated", "reviewed", "final"], state), "unsupported XLIFF segment state")
+        Dim pair As Array Of XMLItem = Elements(segment)
+        DevNeed(Array.Count(pair) >= 1 And Array.Count(pair) <= 2, "invalid XLIFF source/target pair")
+        DevNeed(DevExact(pair(0).Name(), "source"), "XLIFF source must come first")
+        DevNeed(DevExact(PlainText(pair(0), sourceLanguage), DevString(message.Value("default"))), "XLIFF source changed; export a fresh file")
+        If Array.Count(pair) = 1 Then
+            DevNeed(state = "initial", "translated XLIFF segment has no target")
+            Continue For
+        End If
+        DevNeed(DevExact(pair(1).Name(), "target"), "unsupported XLIFF segment content")
+        Dim translated As JSONItem = JSONItem.NewObject()
+        translated.Value("text") = PlainText(pair(1), language)
+        translated.Value("source") = message.Value("default")
+        translated.Value("state") = "translated"
+        If state = "initial" Then translated.Value("state") = "needs-review"
+        Dim translations As JSONItem = message.Value("translations")
+        If translations.IsNull() Then
+            translations = JSONItem.NewObject()
+            message.Value("translations") = translations
+        End If
+        translations.Value(language) = translated
+    Next
+    Return updated
+End Function

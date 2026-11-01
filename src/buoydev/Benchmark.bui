@@ -1,0 +1,92 @@
+Import Common
+Import TestRunner
+Import TaskArgs
+
+Public Function DevBenchmark(configPath As String, taskName As String, iterations As Integer, warmups As Integer, budget As Double, output As String) As Integer
+    DevNeed(iterations >= 1 And iterations <= 1000, "iterations must be in 1..1000")
+    DevNeed(warmups >= 0 And warmups <= 100, "warmups must be in 0..100")
+    DevNeed(budget > 0.0 And budget <= 86400.0, "benchmark deadline must be greater than 0 and at most 86400 seconds")
+    DevNeed(output = "" Or Not DevPathsEqual(output, configPath), "benchmark report must differ from configuration")
+    Dim file As New FileSystemItem(DevAbsolute(configPath))
+    Dim root As String = file.ParentPath()
+    Dim config As JSONItem = DevConfig(file.FullPath())
+    Dim tasks As JSONItem = config.Value("tasks")
+    DevNeed(tasks.IsObject() And tasks.HasKey(taskName), "unknown benchmark task: " + taskName)
+    Dim entry As JSONItem = tasks.Value(taskName)
+    Dim argv As Array Of String = DevTaskArguments(entry)
+    Dim timeout As Double = DevNumber(entry.Value("timeout"), 300.0)
+    DevNeed(timeout > 0.0 And timeout < Double.Infinity, "invalid task timeout")
+    Dim cap As Double = DevNumber(config.Value("log_limit"), 1048576.0)
+    DevNeed(cap >= 1 And cap <= 67108864 And Math.Floor(cap) = cap, "invalid log_limit")
+    Dim logLimit As Integer = cap
+    Dim report As JSONItem = JSONItem.NewObject()
+    report.Value("schema") = 1
+    report.Value("task") = taskName
+    report.Value("argv") = DevArray(argv)
+    report.Value("working_directory") = root
+    report.Value("unit") = "seconds"
+    report.Value("measurement") = "process wall time including startup, output draining and cleanup"
+    report.Value("requested") = iterations
+    report.Value("warmups") = warmups
+    Dim samples As JSONItem = JSONItem.NewArray()
+    report.Value("samples") = samples
+    Dim timings As Array Of Double = []
+    Dim deadline As Double = System.Microseconds() / 1000000.0 + budget
+    Dim reason As String = "count"
+    Dim environment As New Map Of String, String()
+    For index As Integer = 0 To warmups + iterations - 1
+        If System.Microseconds() / 1000000.0 >= deadline Then
+            reason = "deadline"
+            Exit For
+        End If
+        Dim sample As JSONItem = JSONItem.NewObject()
+        sample.Value("index") = index + 1
+        sample.Value("phase") = "measured"
+        If index < warmups Then sample.Value("phase") = "warmup"
+        Try
+            Dim resultRecord As JSONItem = DevExecute(argv, root, timeout, logLimit, environment, deadline)
+            sample.Value("result") = resultRecord
+            samples.Add(sample)
+            If resultRecord.Value("timeout").AsBoolean().Or(False) Then
+                reason = "timeout"
+                Exit For
+            End If
+            If DevNumber(resultRecord.Value("returncode"), 1.0) <> 0.0 Then
+                reason = "failure"
+                Exit For
+            End If
+            If index >= warmups Then Array.Append(timings, DevNumber(resultRecord.Value("seconds"), 0.0))
+        Catch e As Exception
+            sample.Value("error") = e.Message
+            samples.Add(sample)
+            reason = "error"
+            Exit For
+        End Try
+    Next
+    report.Value("complete") = True
+    report.Value("stop_reason") = reason
+    Dim summary As JSONItem = JSONItem.NewObject()
+    Dim count As Integer = Array.Count(timings)
+    summary.Value("count") = count
+    If count > 0 Then
+        Array.Sort(timings)
+        Dim total As Double = 0.0
+        For Each duration As Double In timings
+            total += duration
+        Next
+        summary.Value("min") = timings(0)
+        summary.Value("max") = timings(count - 1)
+        Dim divisor As Double = count
+        summary.Value("mean") = total / divisor
+        Dim median As Double = timings(count \ 2)
+        If count Mod 2 = 0 Then median = (timings(count \ 2 - 1) + timings(count \ 2)) / 2.0
+        summary.Value("median") = median
+    End If
+    report.Value("summary") = summary
+    Dim content As String = Json.Stringify(report) + "\n"
+    StdOut.Write(content)
+    ' Preserve completed samples even if saving the optional report fails.
+    If output <> "" Then DevWrite(output, content)
+    If reason <> "count" Then Return 1
+    Return 0
+End Function

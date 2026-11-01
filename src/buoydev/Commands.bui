@@ -1,0 +1,429 @@
+Import Common
+Import "Localization"
+Import TestRunner
+Import GuiLint
+Import BuildEngine
+Import Formatter
+Import Extract
+Import Xliff
+Import Benchmark
+Import TaskArgs
+Import zip.Zip
+
+Private Class CommandArgs
+    Public Property Options As JSONItem = JSONItem.NewObject()
+    Public Property Positionals As Array Of String = []
+    Public Property Targets As Array Of String = []
+
+    Public Function Get(name As String, fallback As String = "") As String
+        Return Options.Value(name).AsString().Or(fallback)
+    End Function
+
+    Public Function Has(name As String) As Boolean
+        Return Options.HasKey(name)
+    End Function
+
+    Public Sub Parse(arguments As Array Of String, valueOptions As Array Of String, switches As Array Of String)
+        Dim index As Integer = 0
+        Dim literal As Boolean = False
+        While index < Array.Count(arguments)
+            Dim argument As String = arguments(index)
+            If argument = "--" And Not literal Then
+                literal = True
+                index += 1
+                Continue While
+            End If
+            If Not literal And String.StartsWith(argument, "--", True) Then
+                Dim equalsAt As Integer = String.IndexOf(argument, "=", 0, True)
+                Dim name As String = argument
+                Dim optionValue As String = ""
+                If equalsAt > 0 Then
+                    name = String.Left(argument, equalsAt)
+                    optionValue = String.Substring(argument, equalsAt + 1)
+                End If
+                If DevHas(switches, name) Then
+                    DevNeed(equalsAt < 0, "switch does not accept a value: " + name)
+                    Options.Value(name) = True
+                Else
+                    DevNeed(DevHas(valueOptions, name), "unknown option: " + name)
+                    If equalsAt < 0 Then
+                        index += 1
+                        DevNeed(index < Array.Count(arguments), "missing value for " + name)
+                        optionValue = arguments(index)
+                    End If
+                    If name = "--target" Then Array.Append(Targets, optionValue)
+                    If DevHas(["--suite", "--exclude-suite", "--case", "--exclude-case"], name) Then
+                        If Not Options.HasKey(name) Then Options.Value(name) = JSONItem.NewArray()
+                        If Not DevHas(DevStrings(Options.Value(name)), optionValue) Then Options.Value(name).Add(optionValue)
+                    Else
+                        Options.Value(name) = optionValue
+                    End If
+                End If
+            Else
+                DevNeed(literal Or Not String.StartsWith(argument, "-", True), "unknown option: " + argument)
+                Array.Append(Positionals, argument)
+            End If
+            index += 1
+        End While
+    End Sub
+
+    Public Function Required(name As String) As String
+        DevNeed(Me.Has(name), "required option: " + name)
+        Return Me.Get(name)
+    End Function
+End Class
+
+Private Function PlatformName() As String
+    #If TargetWindows Then
+        Return "win32"
+    #ElseIf TargetMac Then
+        Return "darwin"
+    #Else
+        Return "linux"
+    #End If
+End Function
+
+Private Function ManifestInArchive(filename As String) As JSONItem
+    Dim opened As Result Of ZipReader, ZipError = ZipReader.Open(filename)
+    DevNeed(opened.IsOk, "cannot open package: " + filename)
+    Dim reader As ZipReader = opened.Value
+    Try
+        DevNeed(reader.LocateEntry("manifest.json", False), "package manifest is missing")
+        DevNeed(reader.CurrentEntry.UncompressedSize <= 16777216, "package manifest is too large")
+        Dim data As Optional Of Bytes = reader.ExtractCurrentEntryToBytes()
+        DevNeed(data.HasValue, "cannot read package manifest")
+        Return DevParse(data.Value.ToString(Text.Encodings.UTF8))
+    Finally
+        reader.Close()
+    End Try
+End Function
+
+Private Function Doctor(configPath As String) As Integer
+    Dim file As New FileSystemItem(DevAbsolute(configPath))
+    Dim config As JSONItem = DevConfig(file.FullPath())
+    Dim root As String = file.ParentPath()
+    Dim report As JSONItem = JSONItem.NewObject()
+    report.Value("schema") = 1
+    report.Value("implementation") = "Buoy"
+    report.Value("platform") = PlatformName()
+    Dim compiler As JSONItem = JSONItem.NewObject()
+    Dim requested As String = DevCompiler(config)
+    compiler.Value("requested") = requested
+    Dim resolved As String = DevWhich(requested)
+    compiler.Value("resolved") = JSONItem.Null()
+    Dim problems As JSONItem = JSONItem.NewArray()
+    If resolved = "" Then
+        problems.Add("compiler not found")
+    Else
+        compiler.Value("resolved") = resolved
+        Dim version As JSONItem = DevExecute([resolved, "--version"], root, 10.0)
+        compiler.Value("version") = version
+        If DevNumber(version.Value("returncode"), 1.0) <> 0.0 Then problems.Add("compiler version command failed")
+        ' Only read small text launchers; the compiler binary is not text.
+        Dim launcher As New FileSystemItem(resolved)
+        If launcher.Length() < 16384 Then
+            Dim body As String = DevRead(resolved)
+            If String.StartsWith(body, "#!", True) And String.Contains(body, "/usr/bin/buoy", True) Then compiler.Value("packager") = "/usr/bin/buoy"
+        End If
+    End If
+    report.Value("compiler") = compiler
+    Dim tools As JSONItem = JSONItem.NewObject()
+    For Each tool As String In ["git", "tar", "cmake", "cc"]
+        Dim found As String = DevWhich(tool)
+        tools.Value(tool) = JSONItem.Null()
+        If found <> "" Then tools.Value(tool) = found
+    Next
+    report.Value("tools") = tools
+    Dim packages As JSONItem = JSONItem.NewArray()
+    Dim archives As Array Of String = []
+    Dim suites As JSONItem = config.Value("tests")
+    If config.HasKey("tests") Then DevNeed(suites.IsArray(), "tests must be an array")
+    For i As Integer = 0 To suites.Count() - 1
+        Dim suite As JSONItem = suites.ValueAt(i)
+        Dim name As String = DevString(suite.Value("name"))
+        Try
+            Dim files As Array Of String = DevFiles(root, suite.Value("files"))
+            DevNeed(DevHas(files, DevProjectPath(root, DevString(suite.Value("source")))), "source is not staged")
+        Catch e As Exception
+            problems.Add(name + ": " + e.Message)
+        End Try
+        If suite.HasKey("packages") Then
+            For Each pattern As String In DevStrings(suite.Value("packages"))
+                Try
+                    For Each archive As String In DevFiles(root, DevArray([pattern]))
+                        If Not DevHas(archives, archive) Then Array.Append(archives, archive)
+                    Next
+                Catch e As Exception
+                    problems.Add(name + ": " + e.Message)
+                End Try
+            Next
+        End If
+    Next
+    Array.Sort(archives)
+    For Each archive As String In archives
+        Try
+            Dim manifest As JSONItem = ManifestInArchive(archive)
+            Dim entry As JSONItem = JSONItem.NewObject()
+            entry.Value("path") = String.Substring(archive, String.Len(root) + 1)
+            entry.Value("name") = DevString(manifest.Value("name"))
+            entry.Value("version") = DevString(manifest.Value("version"))
+            packages.Add(entry)
+        Catch e As Exception
+            problems.Add(archive + ": " + e.Message)
+        End Try
+    Next
+    report.Value("packages") = packages
+    report.Value("problems") = problems
+    Print Json.Stringify(report)
+    If problems.Count() > 0 Then Return 1
+    Return 0
+End Function
+
+Private Function TaskCommand(configPath As String, name As String) As Integer
+    Dim file As New FileSystemItem(DevAbsolute(configPath))
+    Dim root As String = file.ParentPath()
+    Dim config As JSONItem = DevConfig(file.FullPath())
+    Dim tasks As JSONItem = config.Value("tasks")
+    DevNeed(tasks.IsObject() And tasks.HasKey(name), "unknown task: " + name)
+    Dim entry As JSONItem = tasks.Value(name)
+    Dim argv As Array Of String = DevTaskArguments(entry)
+    Dim timeout As Double = DevNumber(entry.Value("timeout"), 300.0)
+    Dim limit As Double = DevNumber(config.Value("log_limit"), 1048576.0)
+    DevNeed(limit >= 1 And limit <= 67108864 And Math.Floor(limit) = limit, "invalid log_limit")
+    Dim logLimit As Integer = limit
+    Dim outcome As JSONItem = DevExecute(argv, root, timeout, logLimit)
+    StdOut.Write(DevString(outcome.Value("stdout")))
+    StdErr.Write(DevString(outcome.Value("stderr")))
+    If outcome.Value("truncated").AsBoolean().Or(False) Then StdErr.WriteLine("task output truncated")
+    If outcome.Value("timeout").AsBoolean().Or(False) Or DevNumber(outcome.Value("returncode"), 1.0) <> 0.0 Then Return 1
+    Return 0
+End Function
+
+Private Function SourceDocs(sources As Array Of String, title As String) As String
+    Dim content As String = "# " + title + "\n\nSource declarations with adjacent Buoy doc comments.\n"
+    For Each filename As String In sources
+        Dim file As New FileSystemItem(filename)
+        content += "\n## " + file.Name() + "\n\n"
+        Dim pending As Array Of String = []
+        Dim number As Integer = 0
+        For Each raw As String In DevLines(DevRead(filename))
+            number += 1
+            Dim line As String = String.Trim(raw)
+            If String.StartsWith(line, "'''", True) Then
+                Array.Append(pending, String.Trim(String.Substring(line, 3)))
+                Continue For
+            End If
+            If Array.Count(pending) > 0 And DevMatch(line, "(?i)^(?:(?:Public|Private|Protected|Internal|Shared|Overrides|Abstract|Sequential|Packed)\\s+)*(?:Class|Structure|Interface|Enum|Const|Function|Sub|Property|Declare|Delegate)\\b") Then
+                content += "`" + line + "`\n\n" + String.Join(pending, "\n") + "\n\nSource line: " + Str(number) + "\n\n"
+            End If
+            pending = []
+        Next
+    Next
+    ' Match the source-reference trailing newline contract.
+    If String.EndsWith(content, "\n\n", True) Then content = String.Left(content, String.Len(content) - 1)
+    Return content
+End Function
+
+Private Function Localize(action As String, options As CommandArgs) As Integer
+    DevNeed(Array.Count(options.Positionals) = 1, "l10n requires exactly one catalog")
+    Dim filename As String = options.Positionals(0)
+    Dim original As String = DevRead(filename)
+    Dim value As JSONItem = LCatalog(filename)
+    Dim output As String = options.Get("--output")
+    If output <> "" Then DevNeed(Not DevPathsEqual(output, filename), "output must differ from source catalog")
+    If action = "status" Then
+        Dim found As JSONItem = LProblems(value)
+        Dim report As JSONItem = JSONItem.NewObject()
+        report.Value("schema") = 1
+        report.Value("problems") = found
+        Print Json.Stringify(report)
+        If found.Count() > 0 Then Return 1
+        Return 0
+    End If
+    Dim language As String = options.Get("--language")
+    If action = "export-po" Then
+        DevWrite(options.Required("--output"), LExport(value, options.Required("--language")))
+        Return 0
+    End If
+    If action = "export-xliff" Then
+        DevWrite(options.Required("--output"), LExportXliff(value, options.Required("--language")))
+        Return 0
+    End If
+    If action = "import-po" Or action = "import-xliff" Then
+        Dim updated As JSONItem
+        If action = "import-po" Then
+            updated = LImport(value, options.Required("--language"), DevRead(options.Required("--input")))
+        Else
+            Dim exchange As String
+            Try
+                exchange = DevRead(options.Required("--input"))
+            Catch e As Exception
+                Throw New IOException("cannot read XLIFF as UTF-8 XML 1.0: " + e.Message)
+            End Try
+            updated = LImportXliff(value, options.Required("--language"), exchange)
+        End If
+        LVerify(updated, LGenerated(updated), DevEnvironment("BUOY", "buoy"), options.Targets)
+        DevNeed(DevExact(DevRead(filename), original), "catalog changed during import; retry")
+        Dim formatting As New JSONOptions()
+        formatting.Compact = False
+        formatting.IndentSpacing = 2
+        DevWrite(filename, Json.Stringify(updated, formatting) + "\n")
+        Return 0
+    End If
+    If action = "pseudo" Then
+        language = options.Required("--language")
+        If Not DevHas(DevStrings(value.Value("languages")), language) Then value.Value("languages").Add(language)
+        Dim messages As JSONItem = value.Value("messages")
+        For index As Integer = 0 To messages.Count() - 1
+            Dim message As JSONItem = messages.ValueAt(index)
+            Dim translated As JSONItem = JSONItem.NewObject()
+            translated.Value("text") = LPseudo(DevString(message.Value("default")))
+            translated.Value("source") = message.Value("default")
+            translated.Value("state") = "translated"
+            Dim translations As JSONItem = message.Value("translations")
+            If translations.IsNull() Then
+                translations = JSONItem.NewObject()
+                message.Value("translations") = translations
+            End If
+            translations.Value(language) = translated
+        Next
+    End If
+    Dim content As String = LGenerated(value)
+    LVerify(value, content, DevEnvironment("BUOY", "buoy"), options.Targets)
+    output = options.Required("--output")
+    If options.Has("--check") Then
+        DevNeed(DevExact(DevRead(output), content), "generated localization source is out of date")
+    Else
+        DevWrite(output, content)
+    End If
+    Return 0
+End Function
+
+Public Sub DevHelp()
+    Print "ahoy: native Buoy developer tools"
+    Print "  test [--config buoy.dev.json] [--filter GLOB] [--list] [--check-only]"
+    Print "       [--target TRIPLE ...] [--json FILE] [--junit FILE]"
+    Print "       [--suite PATTERN] [--exclude-suite PATTERN] [--case PATTERN] [--exclude-case PATTERN]"
+    Print "       [--selection FILE | --rerun-failed REPORT] [--repeat N] [--until-failure]"
+    Print "       [--deadline SECONDS] [--cancel-file PATH]"
+    Print "  doctor [--config buoy.dev.json]"
+    Print "  gui-lint SOURCE ... [--platform any|macos|windows|linux] [--profile FILE]"
+    Print "       [--preview result.json] [--json FILE] [--strict] [--require-evidence] [--list-rules]"
+    Print "  task NAME [--config buoy.dev.json]"
+    Print "  bench TASK [--config buoy.dev.json] [--iterations 10] [--warmup 1] [--deadline 300] [--json FILE]"
+    Print "  build|check|clean NAME ... [--config buoy.build.json] [--target TRIPLE]"
+    Print "       [--profile release] [--plan] [--list] [--explain] [--json FILE]"
+    Print "       [--compiler EXECUTABLE] [--packager EXECUTABLE] [--deadline SECONDS] [--cancel-file PATH]"
+    Print "       check also accepts --all-targets. Build commands currently require Python 3.10+."
+    Print "  docs SOURCE ... --output FILE [--title TITLE]"
+    Print "  format SOURCE ... [--check | --write] [--indent 4] [--server buoy-lsp] [--timeout 30] [--target TRIPLE ...]"
+    Print "  l10n generate|pseudo CATALOG --output FILE [--check] [--target TRIPLE ...]"
+    Print "  l10n status CATALOG"
+    Print "  l10n extract SOURCE ... --output CATALOG [--source-language en] [--target TRIPLE ...] [--force]"
+    Print "  l10n export-po CATALOG --language TAG --output FILE"
+    Print "  l10n import-po CATALOG --language TAG --input FILE [--target TRIPLE ...]"
+    Print "  l10n export-xliff CATALOG --language TAG --output FILE"
+    Print "  l10n import-xliff CATALOG --language TAG --input FILE [--target TRIPLE ...]"
+    Print "pseudo also requires --language TAG. Exit codes: 0 success, 1 failed tests/status checks, 2 invalid input/selection or generated-source drift, 3 cancelled."
+End Sub
+
+Public Function DevMain(arguments As Array Of String) As Integer
+    If Array.Count(arguments) = 0 Then
+        DevHelp()
+        Return 2
+    End If
+    If DevHas(arguments, "--help") Or DevHas(arguments, "-h") Then
+        DevHelp()
+        Return 0
+    End If
+    Dim command As String = arguments(0)
+    Dim action As String = ""
+    Dim start As Integer = 1
+    If command = "l10n" Then
+        DevNeed(Array.Count(arguments) >= 2, "l10n requires an action")
+        action = arguments(1)
+        DevNeed(DevHas(["generate", "status", "export-po", "import-po", "pseudo", "extract", "export-xliff", "import-xliff"], action), "unknown l10n action")
+        start = 2
+    End If
+    Dim tail As Array Of String = []
+    For index As Integer = start To Array.Count(arguments) - 1
+        Array.Append(tail, arguments(index))
+    Next
+    Dim options As New CommandArgs()
+    Dim noSwitches As Array Of String = []
+    Select Case command
+    Case "build", "check", "clean"
+        options.Parse(tail, ["--config", "--target", "--profile", "--json", "--compiler", "--packager", "--deadline", "--cancel-file"], ["--plan", "--list", "--explain", "--all-targets"])
+        DevNeed(Array.Count(options.Targets) <= 1, "build accepts one --target")
+        Dim seconds As Double = 4500.0
+        If options.Has("--deadline") Then
+            Dim number As JSONItem = DevParse(options.Get("--deadline"))
+            DevNeed(number.IsNumber(), "invalid build deadline")
+            seconds = DevNumber(number, 0.0)
+        End If
+        Return DevBuild(command, tail, options.Has("--plan"), options.Has("--list"), options.Has("--explain"), options.Get("--json"), options.Get("--cancel-file"), seconds)
+    Case "test"
+        options.Parse(tail, ["--config", "--filter", "--target", "--json", "--junit", "--suite", "--exclude-suite", "--case", "--exclude-case", "--selection", "--rerun-failed", "--repeat", "--deadline", "--cancel-file"], ["--list", "--check-only", "--until-failure"])
+        DevNeed(Array.Count(options.Positionals) = 0, "unexpected test argument")
+        Return DevRunTests(options.Get("--config", "buoy.dev.json"), options.Get("--filter", "*"), options.Has("--list"), options.Has("--check-only"), options.Targets, options.Get("--json"), options.Get("--junit"), options.Options)
+    Case "doctor"
+        options.Parse(tail, ["--config"], noSwitches)
+        DevNeed(Array.Count(options.Positionals) = 0, "unexpected doctor argument")
+        Return Doctor(options.Get("--config", "buoy.dev.json"))
+    Case "gui-lint"
+        options.Parse(tail, ["--profile", "--preview", "--platform", "--json"], ["--strict", "--require-evidence", "--list-rules"])
+        If options.Has("--list-rules") Then
+            DevNeed(Array.Count(options.Positionals) = 0, "--list-rules does not accept source files")
+            Return DevGuiLintRules()
+        End If
+        Return DevGuiLint(options.Positionals, options.Get("--profile"), options.Get("--preview"), options.Get("--platform", "any"), options.Get("--json"), options.Has("--strict"), options.Has("--require-evidence"))
+    Case "task"
+        options.Parse(tail, ["--config"], noSwitches)
+        DevNeed(Array.Count(options.Positionals) = 1, "task requires a name")
+        Return TaskCommand(options.Get("--config", "buoy.dev.json"), options.Positionals(0))
+    Case "bench"
+        options.Parse(tail, ["--config", "--iterations", "--warmup", "--deadline", "--json"], noSwitches)
+        DevNeed(Array.Count(options.Positionals) = 1, "bench requires a configured task name")
+        Dim countValue As Result Of Integer, String = Integer.Parse(options.Get("--iterations", "10"))
+        Dim warmupValue As Result Of Integer, String = Integer.Parse(options.Get("--warmup", "1"))
+        DevNeed(countValue.IsOk, "iterations must be a decimal integer")
+        DevNeed(warmupValue.IsOk, "warmup must be a decimal integer")
+        Dim count As Integer = countValue.Value
+        Dim warmups As Integer = warmupValue.Value
+        Dim deadline As JSONItem = DevParse(options.Get("--deadline", "300"))
+        DevNeed(deadline.IsNumber(), "invalid benchmark deadline")
+        Return DevBenchmark(options.Get("--config", "buoy.dev.json"), options.Positionals(0), count, warmups, DevNumber(deadline, 300.0), options.Get("--json"))
+    Case "docs"
+        options.Parse(tail, ["--output", "--title"], noSwitches)
+        DevNeed(Array.Count(options.Positionals) > 0, "docs requires source files")
+        DevWrite(options.Required("--output"), SourceDocs(options.Positionals, options.Get("--title", "Buoy source reference")))
+        Return 0
+    Case "format"
+        options.Parse(tail, ["--indent", "--server", "--timeout", "--target"], ["--check", "--write"])
+        Dim indent As Integer = Integer.Parse(options.Get("--indent", "4")).Or(0)
+        Dim timeout As JSONItem = DevParse(options.Get("--timeout", "30"))
+        DevNeed(timeout.IsNumber(), "invalid formatter timeout")
+        Return DevFormat(options.Positionals, options.Has("--check"), options.Has("--write"), indent, options.Get("--server", DevEnvironment("BUOY_LSP", "buoy-lsp")), DevNumber(timeout, 30.0), options.Targets)
+    Case "l10n"
+        If action = "extract" Then
+            options.Parse(tail, ["--output", "--source-language", "--target"], ["--force"])
+            Return DevExtract(options.Positionals, options.Required("--output"), options.Get("--source-language", "en"), options.Targets, options.Has("--force"))
+        End If
+        Dim valueOptions As Array Of String = []
+        Dim switches As Array Of String = []
+        If action <> "status" Then
+            If action <> "export-po" And action <> "export-xliff" Then Array.Append(valueOptions, "--target")
+            If action <> "generate" Then Array.Append(valueOptions, "--language")
+            If action = "import-po" Or action = "import-xliff" Then
+                Array.Append(valueOptions, "--input")
+            Else
+                Array.Append(valueOptions, "--output")
+            End If
+            If action = "generate" Or action = "pseudo" Then Array.Append(switches, "--check")
+        End If
+        options.Parse(tail, valueOptions, switches)
+        Return Localize(action, options)
+    Case Else
+        Throw New InvalidArgumentException("unknown command: " + command)
+    End Select
+End Function

@@ -1,0 +1,24 @@
+Import Common
+
+Public Function DevTaskArguments(entry As JSONItem) As Array Of String
+    Dim argv As Array Of String = DevStrings(entry.Value("argv"))
+    DevNeed(Array.Count(argv) > 0, "task argv must not be empty")
+    For index As Integer = 0 To Array.Count(argv) - 1
+        If argv(index) = "{python}" Then
+            Dim preferred As String = DevEnvironment("BUOY_DEV_PYTHON", "")
+            If preferred <> "" Then
+                argv(index) = DevWhich(preferred)
+                DevNeed(argv(index) <> "", "configured Python executable not found: " + preferred)
+            Else
+                argv(index) = DevWhich("python3")
+                If argv(index) = "" Then argv(index) = DevWhich("python")
+            End If
+            DevNeed(argv(index) <> "", "this configured task requires Python")
+        ElseIf argv(index) = "{ahoy}" Or argv(index) = "{buoy-dev}" Then
+            Dim executable As FileSystemItem = FileSystemItem.ExecutableFile()
+            DevNeed(executable <> Nil, "cannot locate ahoy executable")
+            argv(index) = executable.FullPath()
+        End If
+    Next
+    Return argv
+End Function

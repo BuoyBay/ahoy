@@ -1,0 +1,189 @@
+Import Common
+Import SourceTools
+Import "Localization"
+
+Private Class LocalizationLine
+    Public Property Tokens As Array Of DevSourceToken = []
+    Public Property Line As Integer
+    Public Property IsDoc As Boolean = False
+    Public Property Doc As String
+End Class
+
+Private Function SourceLines(content As String) As Array Of LocalizationLine
+    Dim lines As Array Of LocalizationLine = []
+    Dim current As New LocalizationLine()
+    current.Line = 1
+    For Each token As DevSourceToken In DevSourceTokens(content)
+        If token.Kind = "newline" Then
+            Array.Append(lines, current)
+            current = New LocalizationLine()
+            current.Line = token.Line + 1
+        ElseIf token.Kind = "comment" Then
+            If Array.Count(current.Tokens) = 0 And String.StartsWith(token.Text, "'''", True) Then
+                current.IsDoc = True
+                current.Doc = String.Trim(String.Substring(token.Text, 3))
+            End If
+        Else
+            If Array.Count(current.Tokens) = 0 Then current.Line = token.Line
+            Array.Append(current.Tokens, token)
+        End If
+    Next
+    Array.Append(lines, current)
+    Return lines
+End Function
+
+Private Function Literal(token As DevSourceToken) As String
+    DevNeed(token.Kind = "string", "extraction supports literal strings only, line " + Str(token.Line))
+    ' Only the common, documented Buoy/JSON escapes have identical semantics.
+    ' Buoy can retain unknown escapes literally where JSON would decode them.
+    Dim raw As Bytes = Bytes.FromString(token.Text, Text.Encodings.UTF8)
+    Dim index As Integer = 1
+    While index < raw.Count - 1
+        If raw.Item(index) = 92 Then
+            index += 1
+            DevNeed(index < raw.Count - 1, "unterminated literal escape")
+            Dim escaped As Integer = raw.Item(index)
+            DevNeed(escaped = 92 Or escaped = 34 Or escaped = 110 Or escaped = 114 Or escaped = 116, "unsupported Buoy literal escape at line " + Str(token.Line))
+        End If
+        index += 1
+    End While
+    Return DevString(DevParse(token.Text))
+End Function
+
+Private Function IndexOfTag(tags As Array Of String, tag As String) As Integer
+    For index As Integer = 0 To Array.Count(tags) - 1
+        If DevExact(tags(index), tag) Then Return index
+    Next
+    Return -1
+End Function
+
+Public Function DevExtract(sources As Array Of String, output As String, sourceLanguage As String, targets As Array Of String, force As Boolean) As Integer
+    DevNeed(Array.Count(sources) > 0, "extract requires source files")
+    DevNeed(DevMatch(sourceLanguage, "\\A[a-z]{2,3}(-[A-Z]{2})?\\z"), "invalid source language")
+    Dim destination As New FileSystemItem(DevAbsolute(output))
+    DevNeed(force Or Not destination.Exists(), "catalog exists; choose a new output or use --force after review")
+    Dim languages As Array Of String = []
+    Dim identities As Array Of String = []
+    Dim messages As JSONItem = JSONItem.NewArray()
+    Dim originals As Array Of String = []
+    Dim paths As Array Of String = []
+    For Each filename As String In sources
+        Dim pathText As String = DevAbsolute(filename)
+        DevNeed(Not DevMatch(pathText, "[\\x00-\\x1f\\x7f]"), "source path contains unsupported control characters")
+        DevNeed(Not DevPathsEqual(pathText, output), "catalog output must differ from source")
+        DevNeed(Not DevHas(paths, pathText), "duplicate extraction input")
+        Dim content As String = DevRead(pathText)
+        Dim lines As Array Of LocalizationLine = SourceLines(content)
+        For Each line As LocalizationLine In lines
+            Dim tokens As Array Of DevSourceToken = line.Tokens
+            If Array.Count(tokens) > 1 Then
+                If tokens(0).Text = "#" And DevHas(["if", "elseif", "else", "end"], String.LCase(tokens(1).Text)) Then
+                    Throw New InvalidArgumentException("conditional source requires target-aware extraction; no catalog written")
+                End If
+            End If
+        Next
+        DevCheckSource(content, pathText, targets)
+        Array.Append(paths, pathText)
+        Array.Append(originals, content)
+        Dim index As Integer = 0
+        Dim notes As Array Of String = []
+        While index < Array.Count(lines)
+            Dim line As LocalizationLine = lines(index)
+            Dim tokens As Array Of DevSourceToken = line.Tokens
+            If line.IsDoc Then
+                Array.Append(notes, line.Doc)
+                index += 1
+                Continue While
+            End If
+            Dim first As Integer = 0
+            If Array.Count(tokens) > 0 Then
+                If DevHas(["public", "private"], String.LCase(tokens(0).Text)) Then first = 1
+            End If
+            Dim declaration As Boolean = False
+            If Array.Count(tokens) > first Then declaration = String.LCase(tokens(first).Text) = "localization"
+            If Not declaration Then
+                notes = []
+                index += 1
+                Continue While
+            End If
+            DevNeed(Array.Count(tokens) = first + 6, "unsupported Localization declaration at line " + Str(line.Line))
+            DevNeed(String.LCase(tokens(first + 2).Text) = "as" And String.LCase(tokens(first + 3).Text) = "string" And tokens(first + 4).Text = "=", "invalid Localization declaration")
+            Dim identity As String = tokens(first + 1).Text
+            DevNeed(Not DevHas(identities, String.LCase(identity)), "duplicate localization ID across inputs: " + identity)
+            Array.Append(identities, String.LCase(identity))
+            Dim defaultText As String = Literal(tokens(first + 5))
+            Dim message As JSONItem = JSONItem.NewObject()
+            message.Value("id") = identity
+            message.Value("default") = defaultText
+            If Array.Count(notes) > 0 Then message.Value("notes") = String.Join(notes, "\n")
+            message.Value("locations") = DevArray([pathText + ":" + Str(line.Line)])
+            Dim translations As JSONItem = JSONItem.NewObject()
+            message.Value("translations") = translations
+            Dim branchTags As Array Of String = []
+            Dim sourceFallbackChecked As Boolean = False
+            Dim sourceBase As String = String.Split(sourceLanguage, "-")(0)
+            Dim ended As Boolean = False
+            index += 1
+            While index < Array.Count(lines)
+                tokens = lines(index).Tokens
+                index += 1
+                If Array.Count(tokens) = 0 Then Continue While
+                If Array.Count(tokens) = 2 Then
+                    If String.LCase(tokens(0).Text) = "end" And String.LCase(tokens(1).Text) = "localization" Then
+                        ended = True
+                        Exit While
+                    End If
+                End If
+                DevNeed(Array.Count(tokens) = 3, "unsupported localization value expression")
+                Dim tag As String = Literal(tokens(0))
+                DevNeed(tokens(1).Text = ":", "expected translation colon")
+                Dim translated As String = Literal(tokens(2))
+                DevNeed(DevMatch(tag, "\\A[a-z]{2,3}(-[A-Z]{2})?\\z"), "unsupported declaration tag")
+                DevNeed(Not DevHas(branchTags, tag), "duplicate declaration tag")
+                Array.Append(branchTags, tag)
+                If DevExact(String.Split(tag, "-")(0), sourceBase) And Not sourceFallbackChecked Then
+                    DevNeed(DevExact(translated, defaultText), "source-language fallback differs from default; resolve it explicitly before extraction")
+                    sourceFallbackChecked = True
+                End If
+                If DevExact(tag, sourceLanguage) Then
+                    DevNeed(DevExact(translated, defaultText), "source-language branch differs from catalog default")
+                    Continue While
+                End If
+                If Not DevHas(languages, tag) Then Array.Append(languages, tag)
+                Dim translation As JSONItem = JSONItem.NewObject()
+                translation.Value("text") = translated
+                translation.Value("source") = defaultText
+                translation.Value("state") = "translated"
+                translations.Value(tag) = translation
+            End While
+            DevNeed(ended, "unterminated Localization declaration")
+            For left As Integer = 0 To Array.Count(branchTags) - 1
+                For right As Integer = left + 1 To Array.Count(branchTags) - 1
+                    Dim a As String = branchTags(left)
+                    Dim b As String = branchTags(right)
+                    If DevExact(a, sourceLanguage) Or DevExact(b, sourceLanguage) Then Continue For
+                    If DevExact(String.Split(a, "-")(0), String.Split(b, "-")(0)) Then
+                        DevNeed(IndexOfTag(languages, a) < IndexOfTag(languages, b), "incompatible regional branch order across declarations; use separate catalogs")
+                    End If
+                Next
+            Next
+            messages.Add(message)
+            notes = []
+        End While
+    Next
+    DevNeed(messages.Count() > 0, "no literal Localization declarations found")
+    Dim catalog As JSONItem = JSONItem.NewObject()
+    catalog.Value("schema") = 1
+    catalog.Value("source_language") = sourceLanguage
+    catalog.Value("languages") = DevArray(languages)
+    catalog.Value("messages") = messages
+    LVerify(catalog, LGenerated(catalog), DevEnvironment("BUOY", "buoy"), targets)
+    For index As Integer = 0 To Array.Count(paths) - 1
+        DevNeed(DevExact(DevRead(paths(index)), originals(index)), "source changed during extraction")
+    Next
+    Dim formatting As New JSONOptions()
+    formatting.Compact = False
+    formatting.IndentSpacing = 2
+    DevWrite(output, Json.Stringify(catalog, formatting) + "\n")
+    Return 0
+End Function

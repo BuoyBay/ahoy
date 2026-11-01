@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "source_language": "en",
+  "languages": ["fr", "es"],
+  "messages": [
+    {
+      "id": "WelcomeMessage",
+      "default": "Welcome aboard!",
+      "notes": "Greeting in the application window.",
+      "translations": {
+        "fr": {"text": "Bienvenue à bord !", "source": "Welcome aboard!", "state": "translated"},
+        "es": {"text": "¡Bienvenido a bordo!", "source": "Welcome aboard!", "state": "translated"}
+      }
+    },
+    {
+      "id": "SaveButtonText",
+      "default": "Save",
+      "notes": "Button: save the current document.",
+      "translations": {
+        "fr": {"text": "Enregistrer", "source": "Save", "state": "translated"},
+        "es": {"text": "Guardar", "source": "Save", "state": "translated"}
+      }
+    }
+  ]
+}

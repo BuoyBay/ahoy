@@ -1,0 +1,359 @@
+' Native package verification and sealing. Subprocesses receive argument arrays.
+Import ProcessKit
+
+Private Declare Function AhoyAtomicRename Lib "c" Alias "rename" (source As String, destination As String) As Int32
+
+#If Not TargetWindows Then
+Private Declare Function ReadSymbolicLink Lib "c" Alias "readlink" (filename As String, buffer As Ptr, capacity As UInt64) As Int64
+#End If
+
+Private Function ReadText(file As FileSystemItem) As String
+    Dim value As Result Of String, String = file.ReadAllText()
+    If value.IsErr Then Throw New IOException("Cannot read " + file.FullPath() + ": " + value.Error)
+    Return value.Value
+End Function
+
+Private Function ReadJSON(file As FileSystemItem) As JSONItem
+    Return Json.Parse(ReadText(file))
+End Function
+
+Private Function RequiredString(value As JSONItem, key As String) As String
+    Dim item As JSONItem = value.Value(key)
+    If Not item.IsString() Then Throw New InvalidArgumentException("Expected string: " + key)
+    Return item.AsString().Value
+End Function
+
+Private Sub SafeName(value As String)
+    If value = "" Then Throw New InvalidArgumentException("Package name is empty")
+    For Each character As String In String.Chars(value)
+        If Not String.Contains("abcdefghijklmnopqrstuvwxyz0123456789_-", character, True) Then Throw New InvalidArgumentException("Unsafe package name: " + value)
+    Next
+End Sub
+
+Private Sub SafeRelative(value As String)
+    If value = "" Or String.Contains(value, "\\") Or String.Contains(value, ":") Then Throw New InvalidArgumentException("Invalid package input: " + value)
+    For Each part As String In String.Split(value, "/")
+        If part = "" Or part = "." Or part = ".." Or part = ".git" Then Throw New InvalidArgumentException("Unsafe package input: " + value)
+    Next
+End Sub
+
+Private Sub NoSymlink(item As FileSystemItem)
+    #If Not TargetWindows Then
+        Dim buffer As New Bytes(1)
+        If ReadSymbolicLink(item.FullPath(), buffer.DataPtr(), 1) >= 0 Then Throw New IOException("Symbolic package input is unsupported: " + item.FullPath())
+    #End If
+End Sub
+
+Private Sub CopyTree(source As FileSystemItem, destination As FileSystemItem)
+    NoSymlink(source)
+    If source.IsFolder() Then
+        If Not destination.CreateFolder(True) Then Throw New IOException("Cannot create " + destination.FullPath())
+        For Each child As FileSystemItem In source.Children()
+            CopyTree(child, destination.Child(child.Name()))
+        Next
+    ElseIf source.IsFile() Then
+        If Not destination.Parent.CreateFolder(True) Then Throw New IOException("Cannot create " + destination.ParentPath())
+        If Not source.CopyTo(destination) Then Throw New IOException("Cannot copy " + source.FullPath())
+        #If Not TargetWindows Then
+            destination.Permissions.Mode = source.Permissions.Mode And &o777
+        #End If
+    Else
+        Throw New IOException("Missing or unsupported input: " + source.FullPath())
+    End If
+End Sub
+
+Private Sub CopyRelative(source As FileSystemItem, destination As FileSystemItem, relative As String)
+    SafeRelative(relative)
+    Dim cursor As FileSystemItem = source
+    For Each part As String In String.Split(relative, "/")
+        cursor = cursor.Child(part)
+        NoSymlink(cursor)
+    Next
+    CopyTree(source.Child(relative), destination.Child(relative))
+End Sub
+
+Private Class CommandResult
+    Public Property Output As String
+    Public Property ErrorText As String
+    Public Property Code As Integer
+End Class
+
+Private Function Run(executable As String, arguments As Array Of String, directory As String) As CommandResult
+    Dim child As New PipeProcess(executable, arguments, directory, True)
+    Dim commandOutcome As New CommandResult()
+    Dim output As New Bytes()
+    Dim errors As New Bytes()
+    Dim started As Double = DateTime.Now().SecondsFrom1970
+    Try
+        child.CloseInput()
+        While True
+            Dim outPart As Bytes = child.ReadOutput()
+            Dim errPart As Bytes = child.ReadError()
+            If outPart.Count > 0 Then output.Append(outPart.DataPtr(), outPart.Count)
+            If errPart.Count > 0 Then errors.Append(errPart.DataPtr(), errPart.Count)
+            If output.Count + errors.Count > 16777216 Then
+                child.TerminateTree()
+                Throw New IOException("Tool output exceeded 16 MiB: " + executable)
+            End If
+            Dim running As Boolean = child.Poll()
+            If Not running And child.OutputClosed And child.ErrorClosed Then Exit While
+            If DateTime.Now().SecondsFrom1970 - started > 180 Then
+                child.TerminateTree()
+                Throw New IOException("Tool exceeded 180 seconds: " + executable)
+            End If
+            Thread.Sleep(5)
+        End While
+        commandOutcome.Code = child.ExitCode
+        commandOutcome.Output = output.ToString(Text.Encodings.UTF8)
+        commandOutcome.ErrorText = errors.ToString(Text.Encodings.UTF8)
+        Return commandOutcome
+    Finally
+        child.Close()
+    End Try
+End Function
+
+Private Function ResolveExecutable(value As String) As String
+    If value = "" Then Throw New InvalidArgumentException("Empty executable selection")
+    If String.StartsWith(value, "/") Then
+        If Not New FileSystemItem(value).IsFile() Then Throw New IOException("Executable is missing: " + value)
+        Return value
+    End If
+    If String.Contains(value, "/") Then Throw New InvalidArgumentException("Executable paths must be absolute: " + value)
+    For Each directory As String In String.Split(System.EnvironmentVariable("PATH").Or("/usr/bin:/bin"), ":")
+        If Not String.StartsWith(directory, "/") Then Continue For
+        Dim file As FileSystemItem = New FileSystemItem(directory).Child(value)
+        If file.IsFile() Then Return file.FullPath()
+    Next
+    Throw New IOException("Executable not found on absolute PATH entries: " + value)
+End Function
+
+Private Sub NeedSuccess(commandOutcome As CommandResult, description As String)
+    If commandOutcome.Code <> 0 Then Throw New IOException(description + " failed (" + String.From(commandOutcome.Code) + ")\n" + commandOutcome.Output + commandOutcome.ErrorText)
+End Sub
+
+Private Function ReadEnvironment(name As String, fallback As String) As String
+    Return System.EnvironmentVariable(name).Or(fallback)
+End Function
+
+Private Sub WriteText(file As FileSystemItem, value As String)
+    If Not file.Parent.CreateFolder(True) Then Throw New IOException("Cannot create " + file.ParentPath())
+    Dim outcome As Result Of Integer, String = file.WriteAllText(value)
+    If outcome.IsErr Then Throw New IOException("Cannot write " + file.FullPath() + ": " + outcome.Error)
+End Sub
+
+Private Sub WriteAtomic(file As FileSystemItem, value As String)
+    Dim staged As FileSystemItem = file.Parent.Child(file.Name() + ".staging-" + String.From(System.Microseconds()))
+    WriteText(staged, value)
+    If AhoyAtomicRename(staged.FullPath(), file.FullPath()) <> 0 Then Throw New IOException("Cannot atomically publish " + file.FullPath())
+End Sub
+
+Private Function Library(root As FileSystemItem, name As String) As FileSystemItem
+    For Each candidate As FileSystemItem In [root.Child("repos/" + name), root.Child("libraries/" + name), root.Child("repos/" + name + "/libraries/" + name), root.Parent.Child(name)]
+        If candidate.Child("manifest.json").IsFile() Then Return candidate
+    Next
+    Throw New IOException("Missing package source: " + name)
+End Function
+
+Private Function Tool(root As FileSystemItem, relative As String) As FileSystemItem
+    If relative = "buoy_dev.bui" Then
+        For Each candidate As FileSystemItem In [root.Child("repos/ahoy/src/main.bui"), root.Child("src/main.bui"), root.Child("tools/buoy_dev.bui")]
+            If candidate.IsFile() Then Return candidate
+        Next
+    ElseIf relative = "buoydev" Then
+        For Each candidate As FileSystemItem In [root.Child("repos/ahoy/src/buoydev"), root.Child("src/buoydev"), root.Child("tools/buoydev")]
+            If candidate.IsFolder() Then Return candidate
+        Next
+    End If
+    For Each candidate As FileSystemItem In [root.Child("tools/" + relative), root.Child("repos/ahoy/tools/" + relative), root.Child("repos/devtools/tools/" + relative), root.Parent.Child("devtools/tools/" + relative)]
+        If candidate.IsFile() Then Return candidate
+    Next
+    Throw New IOException("Missing developer tool source: " + relative)
+End Function
+
+Private Function SDKPackage(name As String) As FileSystemItem
+    Dim roots As Array Of String = [ReadEnvironment("BUOY_PACKAGES_DIR", "/usr/share/buoy/packages"), "/Applications/Buoy/packages"]
+    For Each installRoot As String In roots
+        Dim folder As New FileSystemItem(installRoot)
+        If Not folder.IsFolder() Then Continue For
+        Dim match As FileSystemItem = Nil
+        For Each file As FileSystemItem In folder.Children()
+            If String.StartsWith(file.Name(), name + "-") And String.EndsWith(file.Name(), ".buipkg") Then
+                If match <> Nil Then Throw New IOException("Multiple installed " + name + " archives in " + installRoot)
+                match = file
+            End If
+        Next
+        If match <> Nil Then Return match
+    Next
+    Throw New IOException("Missing installed " + name + " package; set BUOY_PACKAGES_DIR")
+End Function
+
+Private Function Digest(file As FileSystemItem) As String
+    Dim outcome As CommandResult = Run(ResolveExecutable("sha256sum"), [file.FullPath()], file.ParentPath())
+    NeedSuccess(outcome, "SHA-256")
+    Return String.Split(String.Trim(outcome.Output), " ")(0)
+End Function
+
+Private Sub Seal(root As FileSystemItem, stage As FileSystemItem, name As String, packager As String)
+    Dim source As FileSystemItem = Library(root, name)
+    Dim manifest As JSONItem = ReadJSON(source.Child("manifest.json"))
+    Dim version As String = RequiredString(manifest, "version")
+    Dim outcome As CommandResult = Run(packager, ["pkg", "seal", source.FullPath(), "-o", stage.Child("packages/" + name + "-" + version + ".buipkg").FullPath()], stage.FullPath())
+    NeedSuccess(outcome, "Seal " + name)
+End Sub
+
+Private Sub ProcessPackage(root As FileSystemItem, stage As FileSystemItem, packager As String, cc As String, triple As String)
+    Dim source As FileSystemItem = Library(root, "processkit")
+    Dim packageRoot As FileSystemItem = stage.Child("processkit")
+    For Each name As String In ["manifest.json", "modules", "resources", "LICENSE", "LICENSES", "NOTICE.md"]
+        If source.Child(name).Exists() Then CopyTree(source.Child(name), packageRoot.Child(name))
+    Next
+    Dim runtime As FileSystemItem = packageRoot.Child("runtime/" + triple + "/libbuoy_processkit.so")
+    If Not runtime.Parent.CreateFolder(True) Then Throw New IOException("Cannot create ProcessKit runtime staging")
+    Dim commandOutcome As CommandResult = Run(cc, ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-fPIC", "-shared", "-Wl,-soname,libbuoy_processkit.so", source.Child("native/bridge.c").FullPath(), "-o", runtime.FullPath()], stage.FullPath())
+    NeedSuccess(commandOutcome, "Compile ProcessKit native host")
+    Dim info As CommandResult = Run(ResolveExecutable("file"), [runtime.FullPath()], stage.FullPath())
+    NeedSuccess(info, "Inspect ProcessKit host architecture")
+    If Not String.Contains(info.Output, "ELF 64-bit") Then Throw New IOException("ProcessKit runtime is not ELF64")
+    If String.StartsWith(triple, "x86_64") And Not String.Contains(info.Output, "x86-64") Then Throw New IOException("Wrong ProcessKit x86_64 architecture")
+    If String.StartsWith(triple, "aarch64") And Not String.Contains(info.Output, "aarch64") Then Throw New IOException("Wrong ProcessKit ARM64 architecture")
+    Dim manifest As JSONItem = ReadJSON(packageRoot.Child("manifest.json"))
+    commandOutcome = Run(packager, ["pkg", "seal", packageRoot.FullPath(), "-o", stage.Child("packages/processkit-" + RequiredString(manifest, "version") + ".buipkg").FullPath()], stage.FullPath())
+    NeedSuccess(commandOutcome, "Seal fresh ProcessKit host package")
+End Sub
+
+Private Sub DeployLegacyHelper(root As FileSystemItem, stage As FileSystemItem, output As FileSystemItem)
+    Dim names As Array Of String = ["buoy_build.py", "build_support.py", "buoy_executables.py", "buoydev/__init__.py", "buoydev/common.py", "buoydev/build.py"]
+    Dim digestInput As FileSystemItem = stage.Child("helper-fingerprint")
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Create(digestInput)
+    If opened.IsErr Then Throw New IOException("Cannot create helper fingerprint")
+    Dim writer As BinaryStream = opened.Value
+    Dim separator As New Bytes()
+    separator.Append(0)
+    Try
+        For Each name As String In names
+            writer.WriteString(name)
+            writer.Write(separator)
+            writer.WriteString(ReadText(Tool(root, name)))
+        Next
+    Finally
+        writer.Close()
+    End Try
+    Dim version As String = Digest(digestInput)
+    Dim base As FileSystemItem = output.Parent.Child("buoy-build")
+    Dim snapshot As FileSystemItem = base.Child("versions/" + version)
+    If Not snapshot.Exists() Then
+        For Each name As String In names
+            CopyTree(Tool(root, name), snapshot.Child(name))
+        Next
+    End If
+    WriteAtomic(base.Child("current"), version + "\n")
+    WriteAtomic(base.Child("buoy_build.py"), "import sys, runpy\nfrom pathlib import Path\nsys.dont_write_bytecode = True\nbase = Path(__file__).resolve().parent\nversion = (base / \"current\").read_text().strip()\nfolder = base / \"versions\" / version\nsys.path.insert(0, str(folder))\nrunpy.run_path(str(folder / \"buoy_build.py\"), run_name=\"__main__\")\n")
+End Sub
+
+Function Main(args As Array Of String) As Integer
+    Dim temporary As FileSystemItem = Nil
+    Try
+        #If Not TargetLinux Then
+            Throw New IOException("Native Ahoy builder currently supports Linux hosts; use the documented platform builder elsewhere")
+        #End If
+        Dim rootPath As String = ReadEnvironment("BUOYBAY_ROOT", "")
+        Dim outputPath As String = ""
+        Dim compiler As String = ReadEnvironment("BUOY", "buoy")
+        Dim packager As String = ReadEnvironment("BPM_PACKAGER", "")
+        Dim cc As String = ReadEnvironment("CC", "cc")
+        Dim checkOnly As Boolean = False
+        For index As Integer = 1 To args.Count - 1
+            Dim flag As String = args(index)
+            If flag = "--help" Then
+                Print "build-ahoy --root WORKSPACE [--output FILE] [--compiler EXECUTABLE] [--packager EXECUTABLE] [--cc EXECUTABLE] [--check-only]"
+                Print "Linux host builder; rebuilds ProcessKit, seals source dependencies and checks six targets. No Python subprocess."
+                Print "Recipe build commands still use the deployed legacy Python helper."
+                Return 0
+            ElseIf flag = "--check-only" Then
+                checkOnly = True
+            Else
+                If index + 1 >= args.Count Then Throw New InvalidArgumentException("Missing value for " + flag)
+                index += 1
+                Select Case flag
+                    Case "--root"
+                        rootPath = args(index)
+                    Case "--output"
+                        outputPath = args(index)
+                    Case "--compiler"
+                        compiler = args(index)
+                    Case "--packager"
+                        packager = args(index)
+                    Case "--cc"
+                        cc = args(index)
+                    Case Else
+                        Throw New InvalidArgumentException("Unsupported option: " + flag)
+                End Select
+            End If
+        Next
+        If Not String.StartsWith(rootPath, "/") Then Throw New InvalidArgumentException("--root must be absolute")
+        Dim root As New FileSystemItem(rootPath)
+        If outputPath = "" Then outputPath = root.Child("dist/ahoy-native-client/ahoy").FullPath()
+        If Not String.StartsWith(outputPath, "/") Then Throw New InvalidArgumentException("--output must be absolute")
+        Dim output As New FileSystemItem(outputPath)
+        compiler = ResolveExecutable(compiler)
+        cc = ResolveExecutable(cc)
+        If packager = "" Then
+            packager = compiler
+            If compiler = "/usr/local/bin/buoy" Then packager = "/usr/bin/buoy"
+        End If
+        packager = ResolveExecutable(packager)
+        Dim architecture As CommandResult = Run(ResolveExecutable("uname"), ["-m"], rootPath)
+        NeedSuccess(architecture, "Detect Linux host")
+        Dim triple As String = "x86_64-unknown-linux-gnu"
+        If String.Trim(architecture.Output) = "aarch64" Or String.Trim(architecture.Output) = "arm64" Then
+            triple = "aarch64-unknown-linux-gnu"
+        ElseIf String.Trim(architecture.Output) <> "x86_64" Then
+            Throw New IOException("Unsupported Linux host architecture: " + architecture.Output)
+        End If
+        Dim allocated As CommandResult = Run(ResolveExecutable("mktemp"), ["-d", "/tmp/ahoy-native-build-XXXXXX"], rootPath)
+        NeedSuccess(allocated, "Create isolated build staging")
+        temporary = New FileSystemItem(String.Trim(allocated.Output))
+        If Not temporary.Child("packages").CreateFolder() Then Throw New IOException("Cannot create dependency staging")
+        ProcessPackage(root, temporary, packager, cc, triple)
+        For Each name As String In ["lspkit", "editorkit", "layoutkit", "guilintkit"]
+            Seal(root, temporary, name, packager)
+        Next
+        For Each name As String In ["zip", "regex", "crypto", "xml"]
+            Dim archive As FileSystemItem = SDKPackage(name)
+            CopyTree(archive, temporary.Child("packages/" + archive.Name()))
+        Next
+        CopyTree(Tool(root, "buoy_dev.bui"), temporary.Child("buoy_dev.bui"))
+        For Each file As FileSystemItem In Tool(root, "buoydev").Children()
+            If file.IsFile() And String.EndsWith(file.Name(), ".bui") Then CopyTree(file, temporary.Child("buoydev/" + file.Name()))
+        Next
+        For Each target As String In ["arm64-darwin", "x86_64-darwin", "arm64-linux", "x86_64-linux", "arm64-windows", "x86_64-windows"]
+            Dim checked As CommandResult = Run(compiler, ["buoy_dev.bui", "--check", "--diagnostic-format", "json", "--target", target], temporary.FullPath())
+            NeedSuccess(checked, "Check Ahoy for " + target)
+            Dim diagnostics As JSONItem = Json.Parse(checked.Output)
+            If Not diagnostics.Value("errors").IsArray Or Not diagnostics.Value("warnings").IsArray Then Throw New IOException("Invalid compiler diagnostic envelope for " + target)
+            If diagnostics.Value("errors").Count <> 0 Then Throw New IOException("Ahoy diagnostics for " + target + ": " + checked.Output)
+            If diagnostics.Value("warnings").Count > 0 Then StdErr.WriteLine("Ahoy warnings for " + target + ": " + diagnostics.Value("warnings").ToString())
+            Print "Checked Ahoy " + target
+        Next
+        If checkOnly Then Return 0
+        Dim emitted As FileSystemItem = temporary.Child("output")
+        If Not emitted.CreateFolder() Then Throw New IOException("Cannot create output staging")
+        Dim built As CommandResult = Run(compiler, ["buoy_dev.bui", "-o", emitted.Child(output.Name()).FullPath()], temporary.FullPath())
+        NeedSuccess(built, "Build native Ahoy")
+        If Not output.Parent.CreateFolder(True) Then Throw New IOException("Cannot create output directory")
+        For Each file As FileSystemItem In emitted.Children()
+            CopyTree(file, output.Parent.Child(file.Name()))
+        Next
+        DeployLegacyHelper(root, temporary, output)
+        Dim help As CommandResult = Run(output.FullPath(), ["--help"], rootPath)
+        NeedSuccess(help, "Run built Ahoy help")
+        If Not String.Contains(help.Output, "ahoy: native Buoy developer tools") Then Throw New IOException("Built Ahoy has unexpected help output")
+        Print "Built native Ahoy: " + output.FullPath()
+        Return 0
+    Catch problem As Exception
+        StdErr.WriteLine("build-ahoy: " + problem.Message)
+        Return 1
+    Finally
+        If temporary <> Nil Then temporary.Delete(True)
+    End Try
+End Function

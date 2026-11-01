@@ -1,0 +1,18 @@
+Import "buoydev/Commands"
+Import "buoydev/Common"
+
+Sub Main(args As Array Of String)
+    Dim arguments As Array Of String = []
+    For index As Integer = 1 To Array.Count(args) - 1
+        Array.Append(arguments, args(index))
+    Next
+    Dim status As Integer = 2
+    Try
+        status = DevMain(arguments)
+    Catch e As Exception
+        StdErr.WriteLine("ahoy: " + e.Message)
+    End Try
+    StdOut.Flush()
+    StdErr.Flush()
+    DevExit(status)
+End Sub

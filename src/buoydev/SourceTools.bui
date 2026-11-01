@@ -1,0 +1,167 @@
+Import Common
+
+''' Lexical tokens retain comments, literal spelling and statement boundaries.
+Public Class DevSourceToken
+    Public Property Text As String
+    Public Property Kind As String
+    Public Property Line As Integer
+    Public Sub Constructor(content As String, tokenKind As String, sourceLine As Integer)
+        Text = content
+        Kind = tokenKind
+        Line = sourceLine
+    End Sub
+End Class
+
+Private Function WordByte(octet As Integer) As Boolean
+    Return (octet >= 48 And octet <= 57) Or (octet >= 65 And octet <= 90) Or (octet >= 97 And octet <= 122) Or octet = 95 Or octet >= 128
+End Function
+
+Public Function DevSourceTokens(content As String) As Array Of DevSourceToken
+    Dim raw As Bytes = Bytes.FromString(content, Text.Encodings.UTF8)
+    DevNeed(raw.Count <= 2097152, "source exceeds two MiB")
+    Dim tokens As Array Of DevSourceToken = []
+    Dim offset As Integer = 0
+    Dim line As Integer = 1
+    While offset < raw.Count
+        Dim octet As Integer = raw.Item(offset)
+        Dim following As Integer = -1
+        If offset + 1 < raw.Count Then following = raw.Item(offset + 1)
+        If octet = 32 Or octet = 9 Then
+            offset += 1
+            Continue While
+        End If
+        If octet = 13 Or octet = 10 Then
+            If octet = 13 And following = 10 Then offset += 1
+            Array.Append(tokens, New DevSourceToken("\n", "newline", line))
+            line += 1
+            offset += 1
+            Continue While
+        End If
+        Dim start As Integer = offset
+        Dim startLine As Integer = line
+        Dim kind As String = "punctuation"
+        If octet = 39 Or (octet = 47 And following = 47) Then
+            kind = "comment"
+            While offset < raw.Count
+                octet = raw.Item(offset)
+                If octet = 10 Or octet = 13 Then Exit While
+                offset += 1
+            End While
+        ElseIf octet = 47 And following = 42 Then
+            kind = "comment"
+            offset += 2
+            Dim closed As Boolean = False
+            While offset + 1 < raw.Count
+                If raw.Item(offset) = 42 And raw.Item(offset + 1) = 47 Then
+                    closed = True
+                    Exit While
+                End If
+                If raw.Item(offset) = 10 Or (raw.Item(offset) = 13 And raw.Item(offset + 1) <> 10) Then line += 1
+                offset += 1
+            End While
+            DevNeed(closed, "unterminated block comment")
+            offset += 2
+        ElseIf octet = 34 Then
+            kind = "string"
+            offset += 1
+            Dim closed As Boolean = False
+            While offset < raw.Count
+                octet = raw.Item(offset)
+                DevNeed(octet <> 10 And octet <> 13, "multiline string literal is unsupported")
+                offset += 1
+                If octet = 92 Then
+                    DevNeed(offset < raw.Count, "unterminated string escape")
+                    offset += 1
+                ElseIf octet = 34 Then
+                    closed = True
+                    Exit While
+                End If
+            End While
+            DevNeed(closed, "unterminated string literal")
+        ElseIf (octet >= 48 And octet <= 57) Or (octet = 46 And following >= 48 And following <= 57) Then
+            ' Keep numeric spelling atomic, including a signed exponent. Splitting
+            ' 1e-2 into 1e, -, 2 would hide a semantic whitespace change.
+            kind = "number"
+            offset += 1
+            While offset < raw.Count
+                octet = raw.Item(offset)
+                Dim previous As Integer = raw.Item(offset - 1)
+                If WordByte(octet) Or octet = 46 Then
+                    offset += 1
+                ElseIf (octet = 43 Or octet = 45) And (previous = 69 Or previous = 101 Or previous = 68 Or previous = 100) Then
+                    offset += 1
+                Else
+                    Exit While
+                End If
+            End While
+        ElseIf WordByte(octet) Then
+            kind = "word"
+            offset += 1
+            While offset < raw.Count
+                If Not WordByte(raw.Item(offset)) Then Exit While
+                offset += 1
+            End While
+        Else
+            Dim pair As String = ""
+            If following >= 0 And following < 128 Then pair = String.Chr(octet) + String.Chr(following)
+            If DevHas(["+=", "-=", "*=", "/=", "\\=", "<=", ">=", "<>", ":=", "=>", "<<", ">>"], pair) Then
+                offset += 2
+            Else
+                offset += 1
+            End If
+        End If
+        Dim data As New Bytes()
+        data.Append(CType(CType(raw.DataPtr(), Integer) + start, Ptr), offset - start)
+        Array.Append(tokens, New DevSourceToken(data.ToString(Text.Encodings.UTF8), kind, startLine))
+        DevNeed(Array.Count(tokens) <= 200000, "source exceeds token limit")
+    End While
+    Return tokens
+End Function
+
+Public Function DevSourceSignature(content As String) As String
+    Dim signature As JSONItem = JSONItem.NewArray()
+    For Each token As DevSourceToken In DevSourceTokens(content)
+        If token.Kind = "newline" Then
+            signature.Add("\n")
+        Else
+            signature.Add(token.Kind + ":" + token.Text)
+        End If
+    Next
+    ' Permit adding/removing a final line terminator, but no statement joins.
+    While signature.Count() > 0 And signature.ValueAt(signature.Count() - 1).AsString().Or("") = "\n"
+        signature.RemoveAt(signature.Count() - 1)
+    End While
+    signature.Add("\n")
+    Return Json.Stringify(signature)
+End Function
+
+''' Check an edited source with imports relative to its original directory.
+Public Sub DevCheckSource(content As String, filename As String, targets As Array Of String)
+    Dim original As New FileSystemItem(DevAbsolute(filename))
+    Dim reservation As String = DevTemp(".buoy-source-check-", original.ParentPath())
+    Dim candidate As New FileSystemItem(reservation + ".bui")
+    Dim created As Boolean = False
+    Try
+        DevNeed(Not candidate.Exists(), "source-check filename collision")
+        DevWrite(candidate.FullPath(), content)
+        created = True
+        Dim checks As Array Of String = targets
+        If Array.Count(checks) = 0 Then checks = [""]
+        For Each target As String In checks
+            Dim argv As Array Of String = Array.AsResizable([DevEnvironment("BUOY", "buoy"), candidate.FullPath(), "--check", "--diagnostic-format", "json"])
+            If target <> "" Then
+                Array.Append(argv, "--target")
+                Array.Append(argv, target)
+            End If
+            Dim outcome As JSONItem = DevExecute(argv, original.ParentPath())
+            DevNeed(Not outcome.Value("timeout").AsBoolean().Or(False), "source compiler check timed out")
+            Dim diagnostic As JSONItem = DevParse(DevString(outcome.Value("stdout")))
+            DevNeed(diagnostic.Value("errors").IsArray() And diagnostic.Value("warnings").IsArray(), "invalid source compiler diagnostics")
+            DevNeed(DevNumber(outcome.Value("returncode"), 1.0) = 0.0 And diagnostic.Value("errors").Count() = 0, Json.Stringify(diagnostic))
+            If diagnostic.Value("warnings").Count() > 0 Then StdErr.WriteLine(Json.Stringify(diagnostic.Value("warnings")))
+        Next
+    Finally
+        If created And candidate.Exists() Then DevNeed(candidate.Delete(), "cannot remove source-check file")
+        DevRemoveTree(reservation)
+    End Try
+End Sub

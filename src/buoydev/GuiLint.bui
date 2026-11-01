@@ -1,0 +1,60 @@
+Import Common
+Import guilintkit
+Import layoutkit.LayoutDocument
+
+Public Function DevGuiLintRules() As Integer
+    Dim linter As New GuiLinter()
+    linter.RegisterBuiltinRules()
+    Dim report As JSONItem = JSONItem.NewObject()
+    report.Value("schema") = 1
+    report.Value("rules") = DevArray(linter.RegisteredRuleIds())
+    Print report.ToString()
+    Return 0
+End Function
+
+Public Function DevGuiLint(sources As Array Of String, profileFile As String, previewFile As String, platform As String, output As String, strict As Boolean, requireEvidence As Boolean) As Integer
+    DevNeed(Array.Count(sources) > 0, "gui-lint requires source files")
+    DevNeed(previewFile = "" Or Array.Count(sources) = 1, "--preview requires exactly one source file")
+    Dim profile As JSONItem = Nil
+    If profileFile <> "" Then profile = DevLoad(profileFile)
+    Dim preview As JSONItem = Nil
+    If previewFile <> "" Then preview = DevLoad(previewFile)
+    Dim linter As New GuiLinter()
+    linter.RegisterBuiltinRules()
+    Dim reports As JSONItem = JSONItem.NewArray()
+    Dim failures As Integer = 0
+    Dim errors As Integer = 0
+    Dim advisories As Integer = 0
+    Dim unverified As Integer = 0
+    For Each filename As String In sources
+        Dim absolute As String = DevAbsolute(filename)
+        Dim document As New LayoutDocument(DevRead(absolute))
+        Dim report As JSONItem = linter.Analyse(document, absolute, platform, profile, preview)
+        reports.Add(report)
+        unverified += report.Value("unverified").Count()
+        Dim findings As JSONItem = report.Value("diagnostics")
+        For i As Integer = 0 To findings.Count() - 1
+            Dim severity As String = findings.ValueAt(i).Value("severity").AsString().Or("")
+            If severity = "error" Then
+                errors += 1
+            ElseIf severity = "warning" Then
+                failures += 1
+            Else
+                advisories += 1
+            End If
+        Next
+    Next
+    Dim summary As JSONItem = JSONItem.NewObject()
+    summary.Value("schema") = 1
+    summary.Value("complete") = True
+    summary.Value("reports") = reports
+    summary.Value("warnings") = failures
+    summary.Value("errors") = errors
+    summary.Value("advisories") = advisories
+    summary.Value("unverifiedChecks") = unverified
+    If output <> "" Then DevWrite(output, summary.ToString())
+    Print summary.ToString()
+    If errors > 0 Or failures > 0 Or strict And advisories > 0 Then Return 1
+    If requireEvidence And unverified > 0 Then Return 1
+    Return 0
+End Function

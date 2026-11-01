@@ -1,0 +1,10 @@
+Import Messages
+
+Sub Main()
+    ' Choose UI language explicitly; regional formatting is a separate setting.
+    Assert.StringEqual(WelcomeMessage("fr"), "Bienvenue à bord !", "French greeting")
+    Assert.StringEqual(SaveButtonText("es"), "Guardar", "Spanish caption")
+    Assert.StringEqual(WelcomeMessage("ja"), "Welcome aboard!", "default fallback")
+    Print WelcomeMessage("fr")
+    Print SaveButtonText("es")
+End Sub

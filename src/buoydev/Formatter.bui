@@ -1,0 +1,207 @@
+Import Common
+Import SourceTools
+Import processkit
+Import lspkit
+Import editorkit
+
+Private Class FormatSession
+    Private Property Child As PipeProcess
+    Private Property Decoder As LSPFrameDecoder
+    Private Property Pending As JSONItem = JSONItem.NewArray()
+    Private Property Workspace As String
+    Private Property Deadline As Double
+    Private Property NextId As Integer = 1
+    Private Property Errors As String = ""
+    Public Property Capabilities As JSONItem
+
+    Public Sub Constructor(server As String, seconds As Double)
+        DevNeed(seconds > 0.0 And seconds <= 300.0, "formatter timeout must be in 0..300 seconds")
+        Dim executable As String = DevWhich(server)
+        DevNeed(executable <> "", "language server not found: " + server)
+        Deadline = System.Microseconds() / 1000000.0 + seconds
+        Workspace = DevTemp("buoy-format-lsp-")
+        Try
+            Dim arguments As Array Of String = []
+            Child = New PipeProcess(executable, arguments, Workspace, True)
+            Decoder = New LSPFrameDecoder()
+            Dim parameters As JSONItem = JSONItem.NewObject()
+            parameters.Value("processId") = JSONItem.Null()
+            Dim root As New FileSystemItem(Workspace)
+            parameters.Value("rootUri") = root.URLPath
+            Dim capabilities As JSONItem = JSONItem.NewObject()
+            Dim general As JSONItem = JSONItem.NewObject()
+            general.Value("positionEncodings") = DevArray(["utf-16"])
+            capabilities.Value("general") = general
+            parameters.Value("capabilities") = capabilities
+            Dim initialized As JSONItem = Me.Query("initialize", parameters)
+            Me.Capabilities = initialized.Value("capabilities")
+            DevNeed(Me.Capabilities.Value("documentFormattingProvider").AsBoolean().Or(Me.Capabilities.Value("documentFormattingProvider").IsObject()), "language server does not advertise document formatting")
+            Dim encoding As String = Me.Capabilities.Value("positionEncoding").AsString().Or("utf-16")
+            DevNeed(DevExact(encoding, "utf-16"), "formatter requires UTF-16 LSP positions")
+            Me.Send(Notification("initialized", JSONItem.NewObject()))
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+
+    Private Sub Pump()
+        DevNeed(System.Microseconds() / 1000000.0 < Deadline, "language-server formatting timed out")
+        Dim output As Bytes = Child.ReadOutput()
+        For Each message As JSONItem In Decoder.Feed(output)
+            If message.HasKey("method") Then
+                If message.HasKey("id") Then Me.Send(ErrorResponse(message.Value("id"), -32601, "Unsupported client request", Nil))
+            Else
+                Pending.Add(message)
+            End If
+        Next
+        Dim errorBytes As Bytes = Child.ReadError()
+        If String.Len(Errors) < 65536 And errorBytes.Count > 0 Then
+            Try
+                Errors += errorBytes.ToString(Text.Encodings.UTF8)
+            Catch e As EncodingException
+                Errors += "[invalid UTF-8 on server stderr]"
+            End Try
+        End If
+        DevNeed(Child.Poll() Or Not Child.OutputClosed, "language server exited: " + Errors)
+    End Sub
+
+    Private Sub Send(message As JSONItem)
+        Dim frame As Bytes = EncodeFrame(message)
+        Dim offset As Integer = 0
+        While offset < frame.Count
+            offset += Child.WriteInput(frame, offset)
+            If offset < frame.Count Then
+                Me.Pump()
+                Sleep(1)
+            End If
+        End While
+    End Sub
+
+    Public Function Query(method As String, parameters As JSONItem) As JSONItem
+        Dim id As Integer = NextId
+        NextId += 1
+        Dim number As Double = id
+        Me.Send(Request(JSONItem.From(number), method, parameters))
+        Do
+            Me.Pump()
+            For index As Integer = 0 To Pending.Count() - 1
+                Dim message As JSONItem = Pending.ValueAt(index)
+                If message.Value("id").AsNumber().Or(-1.0) = number Then
+                    Pending.RemoveAt(index)
+                    DevNeed(Not message.HasKey("error"), "language server error: " + Json.Stringify(message.Value("error")))
+                    Return message.Value("result")
+                End If
+            Next
+            DevNeed(Pending.Count() <= 64, "too many unmatched language-server responses")
+            Sleep(1)
+        Loop
+    End Function
+
+    Public Function Format(filename As String, original As String, indent As Integer) As String
+        Dim file As New FileSystemItem(DevAbsolute(filename))
+        Dim textDocument As JSONItem = JSONItem.NewObject()
+        textDocument.Value("uri") = file.URLPath
+        textDocument.Value("languageId") = "buoy"
+        textDocument.Value("version") = 1
+        textDocument.Value("text") = original
+        Dim opened As JSONItem = JSONItem.NewObject()
+        opened.Value("textDocument") = textDocument
+        Me.Send(Notification("textDocument/didOpen", opened))
+        Dim identifier As JSONItem = JSONItem.NewObject()
+        identifier.Value("uri") = file.URLPath
+        Dim parameters As JSONItem = JSONItem.NewObject()
+        parameters.Value("textDocument") = identifier
+        Dim options As JSONItem = JSONItem.NewObject()
+        options.Value("tabSize") = indent
+        options.Value("insertSpaces") = True
+        parameters.Value("options") = options
+        Dim response As JSONItem = Me.Query("textDocument/formatting", parameters)
+        If response.IsNull() Then Return original
+        DevNeed(response.IsArray() And response.Count() <= 4096, "invalid formatter edits")
+        Dim document As New EditorDocument(original, 0)
+        Dim edits As Array Of EditorEdit = []
+        For index As Integer = 0 To response.Count() - 1
+            Dim item As JSONItem = response.ValueAt(index)
+            Dim start As JSONItem = item.Value("range").Value("start")
+            Dim ending As JSONItem = item.Value("range").Value("end")
+            Dim positions As Array Of Integer = []
+            For Each position As JSONItem In [start, ending]
+                Dim line As Double = DevNumber(position.Value("line"), -1.0)
+                Dim character As Double = DevNumber(position.Value("character"), -1.0)
+                DevNeed(line >= 0 And character >= 0 And Math.Floor(line) = line And Math.Floor(character) = character And line <= 2147483647.0 And character <= 2147483647.0, "invalid formatter coordinates")
+                Dim lineNumber As Integer = line
+                Dim column As Integer = character
+                If Array.Count(positions) = 1 And lineNumber = document.LineCount And column = 0 Then
+                    ' buoy-lsp emits a whole-document end sentinel after its final line.
+                    Array.Append(positions, document.ByteLength)
+                Else
+                    Array.Append(positions, document.PositionToByte(lineNumber, column))
+                End If
+            Next
+            Array.Append(edits, New EditorEdit(positions(0), positions(1), DevString(item.Value("newText"))))
+        Next
+        document.ApplyEdits(edits)
+        DevNeed(DevExact(DevSourceSignature(original), DevSourceSignature(document.Text)), "formatter changed tokens, comments or statement boundaries; source left untouched")
+        Return document.Text
+    End Function
+
+    Public Sub Close()
+        If Child <> Nil Then
+            Child.Close()
+            Child = Nil
+        End If
+        If Workspace <> "" Then
+            DevRemoveTree(Workspace)
+            Workspace = ""
+        End If
+    End Sub
+
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+Public Function DevFormat(sources As Array Of String, checkOnly As Boolean, writeChanges As Boolean, indent As Integer, server As String, seconds As Double, targets As Array Of String) As Integer
+    DevNeed(Array.Count(sources) > 0, "format requires source files")
+    DevNeed(Not (checkOnly And writeChanges), "--check and --write are mutually exclusive")
+    DevNeed(checkOnly Or writeChanges Or Array.Count(sources) = 1, "stdout formatting accepts one source; use --check or --write for multiple files")
+    DevNeed(indent >= 1 And indent <= 16, "indent must be in 1..16")
+    Dim originals As Array Of String = []
+    Dim formatted As Array Of String = []
+    Dim files As Array Of String = []
+    Dim changed As Boolean = False
+    For Each source As String In sources
+        Dim filename As String = DevAbsolute(source)
+        DevNeed(Not DevHas(files, filename), "duplicate format source: " + filename)
+        Dim original As String = DevRead(filename)
+        Dim session As New FormatSession(server, seconds)
+        Dim content As String
+        Try
+            content = session.Format(filename, original, indent)
+        Finally
+            session.Close()
+        End Try
+        DevCheckSource(content, filename, targets)
+        Array.Append(files, filename)
+        Array.Append(originals, original)
+        Array.Append(formatted, content)
+        If Not DevExact(original, content) Then changed = True
+    Next
+    ' Prepare every candidate before changing any source, then reject stale input.
+    For index As Integer = 0 To Array.Count(files) - 1
+        DevNeed(DevExact(DevRead(files(index)), originals(index)), "source changed while formatting: " + files(index))
+    Next
+    For index As Integer = 0 To Array.Count(files) - 1
+        If writeChanges Then
+            If Not DevExact(originals(index), formatted(index)) Then DevWrite(files(index), formatted(index))
+            Print files(index)
+        ElseIf checkOnly Then
+            If Not DevExact(originals(index), formatted(index)) Then Print "needs formatting: " + files(index)
+        Else
+            StdOut.Write(formatted(index))
+        End If
+    Next
+    If checkOnly And changed Then Return 1
+    Return 0
+End Function
