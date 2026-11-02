@@ -37,12 +37,4 @@ Keep driver and client runtime libraries in their separate output directories.
 `BUOY_DEV_*` variables and internal compatibility paths remain supported.
 [buoy-run](https://github.com/BuoyBay/buoy-run) is the separate script runner.
 
-## Local Buoy setup
-
-On your own machine, install Buoy and run:
-
-```sh
-buoy ai init --both
-```
-
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)
