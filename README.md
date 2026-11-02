@@ -1,4 +1,4 @@
-# CLI: diagnostics, format, localization, GUI lint, project workflows
+# CLI for diagnostics, format, lint
 
 Ahoy runs project checks, formats source, generates documentation, manages
 localization catalogs, measures benchmarks and lints native GUI layouts. Its
