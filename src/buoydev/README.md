@@ -24,49 +24,36 @@ Native UI checks are available through `ahoy gui-lint SOURCE.bui`.
 See [GUILintKit](https://github.com/BuoyBay/guilintkit/blob/main/README.md) for extensible rules,
 platform profiles, source-matched preview evidence and shared designer snapping.
 
-```sh
-./dist/ahoy task build-testkit
-./dist/ahoy doctor
-./dist/ahoy task test
-./dist/ahoy task localize
-./dist/ahoy task test-tools
-./dist/ahoy task workspace-audit-list
-./dist/ahoy task docs-testkit
+Use `ahoy doctor` to inspect the compiler and configured package inputs. The
+[localization example](../../examples/localization/README.md) provides a catalog
+and source for trying the `l10n` commands.
+
+Register your own commands and source entrypoints in `buoy.dev.json`. For example,
+with an existing project `main.bui`:
+
+```json
+{"schema":1,"tests":[{"name":"example","source":"main.bui","files":["main.bui"]}]}
 ```
 
-`task workspace-audit-list` lists the curated offline workspace suites, separate
-from the seven suites registered for `test`. Run `task workspace-audit` to execute
-that offline inventory and write `dist/workspace-audit.json`. These configured
-tasks require Python; each audit suite has a 180-second timeout and the full task
-has a 4,500-second limit. See the audit guide
-for component selection and the native Buoy port.
+```sh
+ahoy test --config buoy.dev.json
+ahoy test --config buoy.dev.json --list
+```
 
-The shared [buoy.dev.json](https://github.com/BuoyBay/devtools/blob/main/buoy.dev.json) is rooted at its own directory,
-so `--config /path/to/buoy.dev.json` also works from another working directory.
-Configured tasks use literal argument arrays. `{ahoy}` (or the compatibility
-placeholder `{buoy-dev}`) resolves to this
-executable. `{python}` resolves via `BUOY_DEV_PYTHON` or PATH for tasks that
-explicitly need Python. They do not invoke a shell. Task output is bounded; a timeout
-or nonzero exit fails the command. Configurations contain executable commands
-and must be trusted.
-For `task` and `bench`, an empty `BUOY_DEV_PYTHON` uses the normal `python3`,
-then `python` search. An explicit interpreter is resolved from the invocation
-directory before the task changes to its configuration directory.
-
-`doctor` prints JSON with the compiler path/version, host tools and configured
-package manifests. It reports missing inputs and the known Linux wrapper's
-separate packager path. It does not install anything, verify native ABI slices,
-or prove that cross-built programs run on another OS.
+Task names in the examples below are selected from your own configuration.
+Configured command arrays are trusted executable commands; review a configuration
+before running its tasks. `{ahoy}` expands to this executable and `{buoy-dev}`
+remains a compatibility alias. The configured commands do not run through a shell.
 
 ## Declarative builds
 
 ```sh
-./dist/ahoy build --list
-./dist/ahoy build studio --plan --json dist/studio-plan.json
-./dist/ahoy build diffkit processkit --explain --json dist/build.json
-./dist/ahoy build studio
-./dist/ahoy check studio --all-targets --json dist/check.json
-./dist/ahoy clean studio
+ahoy build --list
+ahoy build studio --plan --json dist/studio-plan.json
+ahoy build diffkit processkit --explain --json dist/build.json
+ahoy build studio
+ahoy check studio --all-targets --json dist/check.json
+ahoy clean studio
 ```
 
 The versioned [buoy.build.json](https://github.com/BuoyBay/devtools/blob/main/buoy.build.json) contains the artifact graph.
@@ -188,14 +175,12 @@ Package identity stays in `manifest.json`; recipe `needs` currently supplies loc
 build ordering. The first release does not resolve or install BPM dependencies.
 Update recipes when changing a package's local dependency requirements.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 ## Shared tests
 
 ```sh
-./dist/ahoy test --list
-./dist/ahoy test --filter '*kit' --json dist/tests.json --junit dist/tests.xml
-./dist/ahoy test --check-only --target arm64-darwin --target x86_64-windows
+ahoy test --list
+ahoy test --filter '*kit' --json dist/tests.json --junit dist/tests.xml
+ahoy test --check-only --target arm64-darwin --target x86_64-windows
 ```
 
 The shared configuration registers the localization demo, TestKit, its async demo
@@ -238,17 +223,6 @@ Captured logs replace NUL with U+FFFD to avoid Buoy's NUL-terminated string
 truncation; invalid UTF-8 is also replaced. Logs still drain after reaching the
 retention cap (`log_limit`: 1..67108864 bytes per stream).
 
-Runtime verification covers Linux x64, macOS arm64 and Windows x64. Intel macOS
-is build-checked only. Native runner, selection/repeat/cancellation and reference
-parity evidence is recorded with exact source snapshots in
-`dist/xojounit-macos-validation/results.md` and
-`dist/xojounit-windows-validation/results.md`; latest ProcessKit pipe/sync checks
-are in `dist/xojounit-processkit-final/results.md`.
-
-The existing `tests/run_devtools_tests.py` now uses this execution engine for
-ordinary sealed consumers and examples, retaining its six-target checks.
-Specialized live/native harnesses keep their existing setup adapters.
-
 ## Testing extension contract
 
 The XojoUnit follow-up uses the following shared contract for TestKit, native
@@ -256,11 +230,11 @@ runner, Python reference and Studio. Existing commands and schema-1 readers
 remain supported.
 
 ```sh
-./dist/ahoy test --suite testkit --case '*assert*' --json dist/selected.json
-./dist/ahoy test --rerun-failed dist/test-results.json --json dist/rerun.json
-./dist/ahoy test --suite testkit --repeat 20 --until-failure --deadline 120
-./dist/ahoy task test-testing-extensions
-./dist/ahoy task probe-testkit-native
+ahoy test --suite testkit --case '*assert*' --json dist/selected.json
+ahoy test --rerun-failed dist/test-results.json --json dist/rerun.json
+ahoy test --suite testkit --repeat 20 --until-failure --deadline 120
+ahoy task test-testing-extensions
+ahoy task probe-testkit-native
 ```
 
 - `--filter GLOB` retains suite filtering. New repeatable `--suite PATTERN` and
@@ -340,9 +314,9 @@ the real compiler before changing the destination.
 ## Formatting
 
 ```sh
-./dist/ahoy format path/to/source.bui
-./dist/ahoy format path/to/source.bui --check
-./dist/ahoy format path/to/source.bui --write --target x86_64-linux --target arm64-darwin
+ahoy format path/to/source.bui
+ahoy format path/to/source.bui --check
+ahoy format path/to/source.bui --write --target x86_64-linux --target arm64-darwin
 ```
 
 The installed `buoy-lsp` performs formatting. Override it with `BUOY_LSP` or
@@ -365,7 +339,7 @@ Use repeated `--target` options to check conditional branches for other targets.
 ## Command benchmarks
 
 ```sh
-./dist/ahoy bench localize --iterations 10 --warmup 1 --deadline 300 --json dist/localize-bench.json
+ahoy bench localize --iterations 10 --warmup 1 --deadline 300 --json dist/localize-bench.json
 ```
 
 Benchmarks execute a trusted configured task in its configuration directory,
@@ -385,7 +359,7 @@ deliberately. The runner does not restore task side effects.
 ## Package source reference
 
 ```sh
-./dist/ahoy docs libraries/testkit/modules/TestKit.bui --output dist/docs/testkit.md
+ahoy docs /absolute/path/to/source.bui --output dist/docs/testkit.md
 ```
 
 This extracts adjacent `'''` comments and declaration lines into a Markdown
@@ -394,17 +368,6 @@ documentation sites or parse every grammar feature. It intentionally makes no
 claim to be a semantic API index.
 
 ## Verification and next steps
-
-The final audit record (private maintainer material) lists the three independent reviews,
-resolved findings, verification scope and remaining platform work.
-The [enhancement record](ENHANCEMENTS.md) describes the later source tools,
-XLIFF and benchmark verification separately.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
 
 The [toolchain follow-ups](BUOY_REQUESTS.md) record the semantic source model,
 language-selection, instrumentation and package-map work needed for later

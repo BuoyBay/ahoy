@@ -134,5 +134,3 @@ Pseudolocalization does not validate bidirectional rendering or translation
 quality. This schema-1 workflow covers singular compiled declarations. LocaleKit's
 separate schema-2 catalog companion supports
 plural catalogs; parameterized messages and Xojo imports remain separate work.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

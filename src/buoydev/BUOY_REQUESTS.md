@@ -55,7 +55,7 @@ code cross-compiles; Windows runtime verification remains required. Rebuild each
 ## Dependency graph, coverage and release work
 
 Implement the explicit compiler/LSP package map proposed in
-[BPM's requests](https://github.com/BuoyBay/devtools/blob/main/tools/bpm/BUOY_REQUESTS.md). Then tighten isolated resolution and
+[BPM's requests](https://github.com/BuoyBay/bpm/blob/main/src/BUOY_REQUESTS.md). Then tighten isolated resolution and
 extend Ahoy/BPM Windows execution without POSIX shell dependencies.
 
 Source coverage needs compiler instrumentation and source maps. Sampling
@@ -148,15 +148,6 @@ overall deadlines, fixed-decimal JUnit timing and cooperative cancellation.
 The [extension contract](README.md#testing-extension-contract) specifies flags,
 schemas and failure behavior. No upstream source was copied.
 
-The expanded sealed TestKit consumer has thirteen cases. The shared configuration
-also registers the console async demo and scheduler probe. Linux execution
-confirmed queued console callbacks, no native Timer delivery under console
-pumping, and native timer completion/cleanup under a real desktop loop in Xvfb.
-The separate desktop probe is `tests/testkit_async_native_probe.bui`. On macOS
-arm64 the thirteen-case consumer and the desktop native timer probe pass. Windows
-received compiler checks; its runtime scheduling still needs host validation. Native aborts or blocked callbacks remain the outer process
-watchdog's responsibility.
-
 The Astra and Opus implementation audits led to regression fixes for large-log
 JUnit performance and XML control-character round trips, async callback
 reentrancy/exception capture, eager runtime-suite alias validation, duplicate-key
@@ -228,5 +219,3 @@ and 18 clean compiler checks. Hosted CI provisioning, unsaved-editor hook wiring
 architecture gaps, and final shared packaging remain explicitly documented in
 `design/testing-followups.md`; separate Windows designer acceptance steps are in
 `design/testing-followups-windows.md`.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

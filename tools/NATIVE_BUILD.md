@@ -49,9 +49,6 @@ layout, atomically selects its current snapshot and copies its existing launcher
 it does not execute that helper while building Ahoy. Porting the recipe engine
 is separate work.
 
-The local development checkout includes `tests/validate_native_builder.sh` for
-host build/help/task checks, plus Python behavioral reference suites. These local
-validation files are outside the public source inventory. The build and `--help`
-commands above reproduce the public bootstrap directly. Validation uses
-`BUOY_DEV_BINARY` to select this native-built client, with shared developer test
-support exposed through `PYTHONPATH`.
+After building, run the client's `--help` and exercise the commands you use with
+your project's configuration. `BUOY_DEV_BINARY` selects a prebuilt client for
+compatibility launchers.

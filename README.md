@@ -1,4 +1,4 @@
-# Command-line tools for Buoy development
+# Command-line tools for diagnostics, formatting, localization, GUI lint and project workflows
 
 Ahoy runs project checks, formats source, generates documentation, manages
 localization catalogs, measures benchmarks and lints native GUI layouts. Its
@@ -44,7 +44,5 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)
